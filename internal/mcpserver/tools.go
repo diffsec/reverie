@@ -291,12 +291,35 @@ type WriteInput struct {
 	Source     string          `json:"source,omitempty" jsonschema:"Source attribution (default: inferred)"`
 	Confidence *float64        `json:"confidence,omitempty" jsonschema:"Confidence in [0,1]; defaults to 1.0. Facts only — rejected for episodes."`
 	Episode    *EpisodePayload `json:"episode,omitempty" jsonschema:"if set, writes an L3 episode instead of an L2 fact"`
+	DryRun     bool            `json:"dry_run,omitempty" jsonschema:"if true, preview cluster assignment and supersede candidate without writing"`
 }
 
 // WriteOutput is the output schema for the memory_write tool.
 type WriteOutput struct {
-	ID    string `json:"id"`
-	Layer string `json:"layer"`
+	ID      string        `json:"id,omitempty"`
+	Layer   string        `json:"layer"`
+	DryRun  bool          `json:"dry_run"`
+	Preview *WritePreview `json:"preview,omitempty"`
+}
+
+// WritePreview describes what a memory_write would do when DryRun=true. It is
+// populated only on dry-run responses; committed writes leave Preview nil.
+type WritePreview struct {
+	ProposedClusterID    string              `json:"proposed_cluster_id"`
+	ProposedClusterIsNew bool                `json:"proposed_cluster_is_new"`
+	ProposedSupersedes   *SupersedeCandidate `json:"proposed_supersedes,omitempty"`
+	ContentHash          string              `json:"content_hash"`
+}
+
+// SupersedeCandidate describes the existing fact that a proposed write would
+// supersede. Populated only for fact dry-runs when a near-duplicate exists
+// above the configured conflict threshold.
+type SupersedeCandidate struct {
+	ID         string  `json:"id"`
+	Content    string  `json:"content"`
+	Similarity float32 `json:"similarity"`
+	Subtype    string  `json:"subtype"`
+	CreatedAt  string  `json:"created_at"`
 }
 
 func (s *Server) handleWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in WriteInput) (*mcpsdk.CallToolResult, WriteOutput, error) {
@@ -361,6 +384,22 @@ func (s *Server) writeEpisode(ctx context.Context, in WriteInput) (*mcpsdk.CallT
 
 	h := sha256.Sum256([]byte(embedText))
 	contentHash := fmt.Sprintf("%x", h)
+
+	// Dry-run short-circuit: episodes have no supersede detection. Populate
+	// preview with cluster assignment and content hash; skip insert/tick/
+	// centroid side effects.
+	if in.DryRun {
+		s.logger.Info("memory_write", "dry_run", true, "layer", "l3_episodic", "cluster_id", clusterID, "is_new_cluster", isNew)
+		return nil, WriteOutput{
+			Layer:  string(memory.TypeL3Episodic),
+			DryRun: true,
+			Preview: &WritePreview{
+				ProposedClusterID:    clusterID,
+				ProposedClusterIsNew: isNew,
+				ContentHash:          contentHash,
+			},
+		}, nil
+	}
 
 	episode := memory.Episode{
 		ClusterID:     clusterID,
@@ -445,6 +484,34 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 	similar, err := s.store.FindSimilarFacts(ctx, in.Type, vec, float32(conflictThreshold), 1)
 	if err != nil {
 		s.logger.Warn("memory_write: find similar facts failed", "err", err)
+	}
+
+	// Dry-run short-circuit: return the cluster assignment and any conflict
+	// candidate without inserting the fact, updating centroid, or ticking
+	// decay. Embedding-cache side effects (via CachedProvider) are accepted
+	// per spec — they mirror recall behavior and don't touch the store.
+	if in.DryRun {
+		preview := &WritePreview{
+			ProposedClusterID:    clusterID,
+			ProposedClusterIsNew: isNew,
+			ContentHash:          contentHash,
+		}
+		if len(similar) > 0 && similar[0].Fact != nil {
+			oldFact := similar[0].Fact
+			preview.ProposedSupersedes = &SupersedeCandidate{
+				ID:         oldFact.ID,
+				Content:    oldFact.Content,
+				Similarity: similar[0].Similarity,
+				Subtype:    oldFact.Subtype,
+				CreatedAt:  oldFact.CreatedAt.UTC().Format(time.RFC3339),
+			}
+		}
+		s.logger.Info("memory_write", "dry_run", true, "subtype", in.Type, "content_len", len(in.Content), "cluster_id", clusterID, "is_new_cluster", isNew, "has_supersede_candidate", preview.ProposedSupersedes != nil)
+		return nil, WriteOutput{
+			Layer:   string(memory.TypeL2Semantic),
+			DryRun:  true,
+			Preview: preview,
+		}, nil
 	}
 
 	// Insert the new fact.

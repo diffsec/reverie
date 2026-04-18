@@ -4436,3 +4436,326 @@ func TestHandleWrite_ConfidenceRejectedOnEpisode(t *testing.T) {
 		t.Fatal("expected error when confidence set on episode write")
 	}
 }
+
+// --- 3A: memory_write dry-run tests ---
+
+func TestHandleWrite_DryRun_FreshContent(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["fresh dry-run content"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "fresh dry-run content",
+		Type:    "project",
+		DryRun:  true,
+	})
+	if err != nil {
+		t.Fatalf("dry-run write: %v", err)
+	}
+	if out.ID != "" {
+		t.Errorf("expected empty ID on dry-run, got %q", out.ID)
+	}
+	if !out.DryRun {
+		t.Error("expected out.DryRun=true")
+	}
+	if out.Layer != "l2_semantic" {
+		t.Errorf("expected layer l2_semantic, got %q", out.Layer)
+	}
+	if out.Preview == nil {
+		t.Fatal("expected Preview to be populated")
+	}
+	if out.Preview.ProposedClusterID == "" {
+		t.Error("expected ProposedClusterID to be set")
+	}
+	if !out.Preview.ProposedClusterIsNew {
+		t.Error("expected ProposedClusterIsNew=true for first write in empty store")
+	}
+	if out.Preview.ProposedSupersedes != nil {
+		t.Errorf("expected no supersede candidate on fresh content, got %+v", out.Preview.ProposedSupersedes)
+	}
+	if out.Preview.ContentHash == "" {
+		t.Error("expected ContentHash to be populated")
+	}
+}
+
+func TestHandleWrite_DryRun_NearDuplicateSupersedeCandidate(t *testing.T) {
+	emb := newStubEmbedder(4)
+	// Two vectors with cosine similarity > 0.92.
+	emb.vectors["existing fact about Go"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["near duplicate fact about Go"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Seed one committed fact.
+	_, seed, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "existing fact about Go",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	// Dry-run a near-duplicate; we should surface the seed as a supersede candidate.
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "near duplicate fact about Go",
+		Type:    "project",
+		DryRun:  true,
+	})
+	if err != nil {
+		t.Fatalf("dry-run write: %v", err)
+	}
+	if out.Preview == nil {
+		t.Fatal("expected Preview to be populated")
+	}
+	if out.Preview.ProposedSupersedes == nil {
+		t.Fatal("expected ProposedSupersedes to be populated for near-duplicate")
+	}
+	cand := out.Preview.ProposedSupersedes
+	if cand.ID != seed.ID {
+		t.Errorf("ProposedSupersedes.ID = %q, want %q", cand.ID, seed.ID)
+	}
+	if cand.Content != "existing fact about Go" {
+		t.Errorf("ProposedSupersedes.Content = %q, want %q", cand.Content, "existing fact about Go")
+	}
+	if cand.Subtype != "project" {
+		t.Errorf("ProposedSupersedes.Subtype = %q, want project", cand.Subtype)
+	}
+	if cand.Similarity < 0.92 {
+		t.Errorf("ProposedSupersedes.Similarity = %v, want >= 0.92", cand.Similarity)
+	}
+	if cand.CreatedAt == "" {
+		t.Error("ProposedSupersedes.CreatedAt should be populated")
+	}
+}
+
+func TestHandleWrite_DryRun_LeavesStoreUnchanged(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["pre-existing fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["dry-run content"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["ep-s\nep-a\nep-o\nep-p"] = []float32{0.2, 0.3, 0.4, 0.5}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Seed one fact so the store starts non-empty.
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{Content: "pre-existing fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	factsBefore, err := s.store.ListFacts(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list facts before: %v", err)
+	}
+	episodesBefore, err := s.store.ListEpisodes(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list episodes before: %v", err)
+	}
+
+	// Dry-run fact write.
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{Content: "dry-run content", Type: "project", DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run fact: %v", err)
+	}
+
+	// Dry-run episode write.
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Type:   "feedback",
+		DryRun: true,
+		Episode: &EpisodePayload{
+			Situation: "ep-s", Action: "ep-a", Outcome: "ep-o", Preemptive: "ep-p",
+		},
+	})
+	if err != nil {
+		t.Fatalf("dry-run episode: %v", err)
+	}
+
+	factsAfter, err := s.store.ListFacts(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list facts after: %v", err)
+	}
+	episodesAfter, err := s.store.ListEpisodes(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list episodes after: %v", err)
+	}
+
+	if len(factsAfter) != len(factsBefore) {
+		t.Errorf("dry-run changed facts count: before=%d after=%d", len(factsBefore), len(factsAfter))
+	}
+	if len(episodesAfter) != len(episodesBefore) {
+		t.Errorf("dry-run changed episodes count: before=%d after=%d", len(episodesBefore), len(episodesAfter))
+	}
+	for i := range factsBefore {
+		if factsBefore[i].ID != factsAfter[i].ID {
+			t.Errorf("fact ID changed at index %d", i)
+		}
+	}
+}
+
+func TestHandleWrite_DryRun_DoesNotAdvanceTurnsSince(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["seed for cluster"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["dry-run probe"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, seed, err := s.handleWrite(ctx, nil, WriteInput{Content: "seed for cluster", Type: "project"})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	seedFact, err := s.store.GetFact(ctx, seed.ID)
+	if err != nil || seedFact == nil {
+		t.Fatalf("get seed fact: %v", err)
+	}
+	clusterID := seedFact.ClusterID
+
+	clBefore, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil || clBefore == nil {
+		t.Fatalf("get cluster before: %v", err)
+	}
+	turnsBefore := clBefore.TurnsSince
+
+	// Dry-run write targeting the same cluster.
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{Content: "dry-run probe", Type: "project", DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+
+	clAfter, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil || clAfter == nil {
+		t.Fatalf("get cluster after: %v", err)
+	}
+	if clAfter.TurnsSince != turnsBefore {
+		t.Errorf("turns_since advanced: before=%d after=%d", turnsBefore, clAfter.TurnsSince)
+	}
+}
+
+func TestHandleWrite_DryRun_Episode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["sit\nact\nout\npre"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Type:   "feedback",
+		DryRun: true,
+		Episode: &EpisodePayload{
+			Situation: "sit", Action: "act", Outcome: "out", Preemptive: "pre",
+		},
+	})
+	if err != nil {
+		t.Fatalf("dry-run episode: %v", err)
+	}
+	if out.ID != "" {
+		t.Errorf("expected empty ID on dry-run, got %q", out.ID)
+	}
+	if !out.DryRun {
+		t.Error("expected DryRun=true")
+	}
+	if out.Layer != "l3_episodic" {
+		t.Errorf("expected layer l3_episodic, got %q", out.Layer)
+	}
+	if out.Preview == nil {
+		t.Fatal("expected Preview to be populated")
+	}
+	if out.Preview.ProposedClusterID == "" {
+		t.Error("expected ProposedClusterID to be set")
+	}
+	if out.Preview.ProposedSupersedes != nil {
+		t.Error("episodes have no supersede detection; ProposedSupersedes should be nil")
+	}
+	if out.Preview.ContentHash == "" {
+		t.Error("expected ContentHash to be populated")
+	}
+}
+
+func TestHandleWrite_DryRunFalse_CommittedPathUnchanged(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["committed fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "committed fact",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("committed write: %v", err)
+	}
+	if out.ID == "" {
+		t.Error("expected non-empty ID on committed write")
+	}
+	if out.DryRun {
+		t.Error("expected DryRun=false on committed write")
+	}
+	if out.Preview != nil {
+		t.Errorf("expected nil Preview on committed write, got %+v", out.Preview)
+	}
+	// Verify the fact was actually persisted.
+	f, err := s.store.GetFact(ctx, out.ID)
+	if err != nil || f == nil {
+		t.Fatalf("committed fact should be retrievable: %v", err)
+	}
+}
+
+func TestHandleWrite_DryRun_InvalidInput(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Bad subtype.
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "x",
+		Type:    "invalid_subtype",
+		DryRun:  true,
+	})
+	if err == nil {
+		t.Error("expected error on dry-run with invalid subtype")
+	}
+
+	// Empty content and no episode.
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Type:   "project",
+		DryRun: true,
+	})
+	if err == nil {
+		t.Error("expected error on dry-run with neither content nor episode")
+	}
+
+	// Confidence out of range.
+	bad := 1.5
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Content:    "x",
+		Type:       "project",
+		Confidence: &bad,
+		DryRun:     true,
+	})
+	if err == nil {
+		t.Error("expected error on dry-run with out-of-range confidence")
+	}
+
+	// Confidence on episode.
+	conf := 0.5
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Type:       "feedback",
+		Confidence: &conf,
+		DryRun:     true,
+		Episode: &EpisodePayload{
+			Situation: "s", Action: "a", Outcome: "o", Preemptive: "p",
+		},
+	})
+	if err == nil {
+		t.Error("expected error on dry-run with confidence on episode")
+	}
+}
