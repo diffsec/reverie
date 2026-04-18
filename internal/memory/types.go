@@ -27,8 +27,8 @@ type ClusterNode struct {
 	MetaInstr  string    `json:"meta_instr"`
 	ItemCount  int       `json:"item_count"`
 	Centroid   []float32 `json:"centroid"`
-	Utility    float64   `json:"utility"`    // U_t(c) in [0,1]
-	Frequency  float64   `json:"frequency"`  // F_t(c) in [0,1]
+	Utility    float64   `json:"utility"`     // U_t(c) in [0,1]
+	Frequency  float64   `json:"frequency"`   // F_t(c) in [0,1]
 	TurnsSince int       `json:"turns_since"` // n_t(c)
 	LastAccess time.Time `json:"last_access"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -51,6 +51,11 @@ type Fact struct {
 	// Subtype carries the auto-memory taxonomy classification.
 	// Valid values: "user", "feedback", "project", "reference".
 	Subtype string `json:"subtype"`
+	// Tags is an optional set of categorization labels. The store normalizes
+	// (lowercases/trims/dedupes/sorts) and validates (<=16 tags, <=32 chars
+	// each) on insert. Reads always return a non-nil slice, empty when no
+	// tags are stored.
+	Tags []string `json:"tags"`
 }
 
 // Episode represents an L3 episodic memory — a structured tuple of
@@ -67,6 +72,9 @@ type Episode struct {
 	LinkedFactIDs []string  `json:"linked_fact_ids"`
 	CreatedAt     time.Time `json:"created_at"`
 	AccessedAt    time.Time `json:"accessed_at"`
+	// Tags is an optional set of categorization labels, normalized and
+	// validated at write time. Same rules as Fact.Tags.
+	Tags []string `json:"tags"`
 }
 
 // WorkingMemory is the bounded in-session cache. It holds a sliding window

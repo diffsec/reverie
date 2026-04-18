@@ -70,9 +70,21 @@ func (s *sqliteStore) InsertFact(ctx context.Context, f Fact) (string, error) {
 		f.ClusterID = defaultClusterID
 	}
 
+	// Normalize + validate tags up front so we reject bad input before any
+	// side effects (including the idempotency lookup, though that's read-only).
+	normTags, err := normalizeTags(f.Tags)
+	if err != nil {
+		return "", fmt.Errorf("sqlite store: insert fact: %w", err)
+	}
+	f.Tags = normTags
+	tagsJSON, err := encodeTags(normTags)
+	if err != nil {
+		return "", fmt.Errorf("sqlite store: insert fact: %w", err)
+	}
+
 	// Idempotency: check for existing non-superseded fact with same hash.
 	var existingID string
-	err := s.db.QueryRowContext(ctx,
+	err = s.db.QueryRowContext(ctx,
 		`SELECT id FROM facts WHERE content_hash = ? AND superseded_by IS NULL LIMIT 1`,
 		f.ContentHash,
 	).Scan(&existingID)
@@ -93,8 +105,8 @@ func (s *sqliteStore) InsertFact(ctx context.Context, f Fact) (string, error) {
 	embBlob := EncodeVector(f.Embedding)
 
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO facts (id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO facts (id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.ID,
 		f.ClusterID,
 		f.Content,
@@ -107,6 +119,7 @@ func (s *sqliteStore) InsertFact(ctx context.Context, f Fact) (string, error) {
 		f.SupersededBy,
 		f.CreatedAt.Format(timeFormat),
 		f.AccessedAt.Format(timeFormat),
+		tagsJSON,
 	)
 	if err != nil {
 		return "", fmt.Errorf("sqlite store: insert fact: %w", err)
@@ -116,7 +129,7 @@ func (s *sqliteStore) InsertFact(ctx context.Context, f Fact) (string, error) {
 
 func (s *sqliteStore) GetFact(ctx context.Context, id string) (*Fact, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at
+		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
 		 FROM facts WHERE id = ?`, id,
 	)
 	f, err := scanFact(row)
@@ -151,7 +164,7 @@ func (s *sqliteStore) ListFacts(ctx context.Context, filter ListFilter) ([]Fact,
 		orderCol = "accessed_at"
 	}
 
-	query := `SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at
+	query := `SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
 	          FROM facts WHERE superseded_by IS NULL`
 	args := []any{}
 
@@ -160,6 +173,9 @@ func (s *sqliteStore) ListFacts(ctx context.Context, filter ListFilter) ([]Fact,
 		args = append(args, *filter.Subtype)
 	}
 
+	// TagsAny is applied Go-side: the tags column is a JSON TEXT blob, which
+	// keeps the schema free of JSON1-extension dependencies. The filter is
+	// cheap relative to a fact's embedding cost.
 	query += fmt.Sprintf(` ORDER BY %s DESC LIMIT ? OFFSET ?`, orderCol)
 	args = append(args, limit, filter.Offset)
 
@@ -175,6 +191,9 @@ func (s *sqliteStore) ListFacts(ctx context.Context, filter ListFilter) ([]Fact,
 		if err != nil {
 			return nil, fmt.Errorf("sqlite store: list facts: scan: %w", err)
 		}
+		if !tagMatchesAny(f.Tags, filter.TagsAny) {
+			continue
+		}
 		facts = append(facts, *f)
 	}
 	if err := rows.Err(); err != nil {
@@ -186,7 +205,7 @@ func (s *sqliteStore) ListFacts(ctx context.Context, filter ListFilter) ([]Fact,
 func (s *sqliteStore) GlobalSearch(ctx context.Context, queryVec []float32, limit int) ([]Candidate, error) {
 	// Scan facts.
 	factRows, err := s.db.QueryContext(ctx,
-		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at
+		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
 		 FROM facts WHERE superseded_by IS NULL AND embedding IS NOT NULL`,
 	)
 	if err != nil {
@@ -209,7 +228,7 @@ func (s *sqliteStore) GlobalSearch(ctx context.Context, queryVec []float32, limi
 
 	// Scan episodes.
 	epRows, err := s.db.QueryContext(ctx,
-		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at
+		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at, tags
 		 FROM episodes WHERE embedding IS NOT NULL`,
 	)
 	if err != nil {
@@ -456,6 +475,17 @@ func (s *sqliteStore) InsertEpisode(ctx context.Context, e Episode) (string, err
 		e.ClusterID = defaultClusterID
 	}
 
+	// Normalize + validate tags before touching the DB.
+	normTags, err := normalizeTags(e.Tags)
+	if err != nil {
+		return "", fmt.Errorf("sqlite store: insert episode: %w", err)
+	}
+	e.Tags = normTags
+	tagsJSON, err := encodeTags(normTags)
+	if err != nil {
+		return "", fmt.Errorf("sqlite store: insert episode: %w", err)
+	}
+
 	// Ensure the cluster exists (FK constraint).
 	if e.ClusterID == defaultClusterID {
 		if err := s.ensureDefaultCluster(ctx); err != nil {
@@ -465,9 +495,9 @@ func (s *sqliteStore) InsertEpisode(ctx context.Context, e Episode) (string, err
 
 	embBlob := EncodeVector(e.Embedding)
 
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO episodes (id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO episodes (id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at, tags)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.ID,
 		e.ClusterID,
 		e.Situation,
@@ -478,6 +508,7 @@ func (s *sqliteStore) InsertEpisode(ctx context.Context, e Episode) (string, err
 		e.ContentHash,
 		e.CreatedAt.Format(timeFormat),
 		e.AccessedAt.Format(timeFormat),
+		tagsJSON,
 	)
 	if err != nil {
 		return "", fmt.Errorf("sqlite store: insert episode: %w", err)
@@ -499,7 +530,7 @@ func (s *sqliteStore) InsertEpisode(ctx context.Context, e Episode) (string, err
 
 func (s *sqliteStore) GetEpisode(ctx context.Context, id string) (*Episode, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at
+		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at, tags
 		 FROM episodes WHERE id = ?`, id,
 	)
 	ep, err := scanEpisodeFrom(row)
@@ -555,7 +586,7 @@ func (s *sqliteStore) ListEpisodes(ctx context.Context, filter ListFilter) ([]Ep
 	}
 
 	query := fmt.Sprintf(
-		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at
+		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at, tags
 		 FROM episodes ORDER BY %s DESC LIMIT ? OFFSET ?`, orderCol,
 	)
 
@@ -570,6 +601,9 @@ func (s *sqliteStore) ListEpisodes(ctx context.Context, filter ListFilter) ([]Ep
 		ep, err := scanEpisodeRows(rows)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite store: list episodes: scan: %w", err)
+		}
+		if !tagMatchesAny(ep.Tags, filter.TagsAny) {
+			continue
 		}
 		episodes = append(episodes, *ep)
 	}
@@ -599,7 +633,7 @@ func (s *sqliteStore) GetFactLinks(ctx context.Context, factID string) ([]Episod
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT l.episode_id, l.link_type,
 		        e.id, e.cluster_id, e.situation, e.action, e.outcome, e.preemptive,
-		        e.embedding, e.content_hash, e.created_at, e.accessed_at
+		        e.embedding, e.content_hash, e.created_at, e.accessed_at, e.tags
 		 FROM fact_episode_links l
 		 JOIN episodes e ON e.id = l.episode_id
 		 WHERE l.fact_id = ?`, factID,
@@ -615,11 +649,12 @@ func (s *sqliteStore) GetFactLinks(ctx context.Context, factID string) ([]Episod
 		var ep Episode
 		var embBlob []byte
 		var createdStr, accessedStr string
+		var tagsRaw sql.NullString
 
 		err := rows.Scan(
 			&link.EpisodeID, &link.LinkType,
 			&ep.ID, &ep.ClusterID, &ep.Situation, &ep.Action, &ep.Outcome, &ep.Preemptive,
-			&embBlob, &ep.ContentHash, &createdStr, &accessedStr,
+			&embBlob, &ep.ContentHash, &createdStr, &accessedStr, &tagsRaw,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite store: get fact links: scan: %w", err)
@@ -627,6 +662,11 @@ func (s *sqliteStore) GetFactLinks(ctx context.Context, factID string) ([]Episod
 		ep.Embedding = DecodeVector(embBlob)
 		ep.CreatedAt, _ = time.Parse(timeFormat, createdStr)
 		ep.AccessedAt, _ = time.Parse(timeFormat, accessedStr)
+		tags, decErr := decodeTags(tagsRaw.String)
+		if decErr != nil {
+			return nil, fmt.Errorf("sqlite store: get fact links: %w", decErr)
+		}
+		ep.Tags = tags
 		link.Episode = &ep
 		links = append(links, link)
 	}
@@ -641,7 +681,7 @@ func (s *sqliteStore) GetEpisodeLinks(ctx context.Context, episodeID string) ([]
 		`SELECT l.fact_id, l.link_type,
 		        f.id, f.cluster_id, f.content, f.embedding, f.content_hash,
 		        f.subtype, f.source, f.confidence, f.valid_from,
-		        f.superseded_by, f.created_at, f.accessed_at
+		        f.superseded_by, f.created_at, f.accessed_at, f.tags
 		 FROM fact_episode_links l
 		 JOIN facts f ON f.id = l.fact_id
 		 WHERE l.episode_id = ?`, episodeID,
@@ -658,12 +698,13 @@ func (s *sqliteStore) GetEpisodeLinks(ctx context.Context, episodeID string) ([]
 		var embBlob []byte
 		var subtype, supersededBy sql.NullString
 		var validFromStr, createdStr, accessedStr string
+		var tagsRaw sql.NullString
 
 		err := rows.Scan(
 			&link.FactID, &link.LinkType,
 			&f.ID, &f.ClusterID, &f.Content, &embBlob, &f.ContentHash,
 			&subtype, &f.Source, &f.Confidence, &validFromStr,
-			&supersededBy, &createdStr, &accessedStr,
+			&supersededBy, &createdStr, &accessedStr, &tagsRaw,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite store: get episode links: scan: %w", err)
@@ -678,6 +719,11 @@ func (s *sqliteStore) GetEpisodeLinks(ctx context.Context, episodeID string) ([]
 		f.ValidFrom, _ = time.Parse(timeFormat, validFromStr)
 		f.CreatedAt, _ = time.Parse(timeFormat, createdStr)
 		f.AccessedAt, _ = time.Parse(timeFormat, accessedStr)
+		tags, decErr := decodeTags(tagsRaw.String)
+		if decErr != nil {
+			return nil, fmt.Errorf("sqlite store: get episode links: %w", decErr)
+		}
+		f.Tags = tags
 		link.Fact = &f
 		links = append(links, link)
 	}
@@ -803,7 +849,7 @@ func (s *sqliteStore) SupersedeFact(ctx context.Context, oldID, newID string) er
 
 func (s *sqliteStore) FindSimilarFacts(ctx context.Context, subtype string, queryVec []float32, threshold float32, limit int) ([]Candidate, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at
+		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
 		 FROM facts WHERE superseded_by IS NULL AND embedding IS NOT NULL AND subtype = ?`,
 		subtype,
 	)
@@ -861,11 +907,12 @@ func scanFactFrom(sc scanner) (*Fact, error) {
 	var subtype sql.NullString
 	var supersededBy sql.NullString
 	var validFromStr, createdStr, accessedStr string
+	var tagsRaw sql.NullString
 
 	err := sc.Scan(
 		&f.ID, &f.ClusterID, &f.Content, &embBlob, &f.ContentHash,
 		&subtype, &f.Source, &f.Confidence, &validFromStr,
-		&supersededBy, &createdStr, &accessedStr,
+		&supersededBy, &createdStr, &accessedStr, &tagsRaw,
 	)
 	if err != nil {
 		return nil, err
@@ -882,6 +929,12 @@ func scanFactFrom(sc scanner) (*Fact, error) {
 	f.ValidFrom, _ = time.Parse(timeFormat, validFromStr)
 	f.CreatedAt, _ = time.Parse(timeFormat, createdStr)
 	f.AccessedAt, _ = time.Parse(timeFormat, accessedStr)
+
+	tags, decErr := decodeTags(tagsRaw.String)
+	if decErr != nil {
+		return nil, decErr
+	}
+	f.Tags = tags
 
 	return &f, nil
 }
@@ -901,10 +954,11 @@ func scanEpisodeFrom(sc scanner) (*Episode, error) {
 	var ep Episode
 	var embBlob []byte
 	var createdStr, accessedStr string
+	var tagsRaw sql.NullString
 
 	err := sc.Scan(
 		&ep.ID, &ep.ClusterID, &ep.Situation, &ep.Action, &ep.Outcome, &ep.Preemptive,
-		&embBlob, &ep.ContentHash, &createdStr, &accessedStr,
+		&embBlob, &ep.ContentHash, &createdStr, &accessedStr, &tagsRaw,
 	)
 	if err != nil {
 		return nil, err
@@ -913,6 +967,12 @@ func scanEpisodeFrom(sc scanner) (*Episode, error) {
 	ep.Embedding = DecodeVector(embBlob)
 	ep.CreatedAt, _ = time.Parse(timeFormat, createdStr)
 	ep.AccessedAt, _ = time.Parse(timeFormat, accessedStr)
+
+	tags, decErr := decodeTags(tagsRaw.String)
+	if decErr != nil {
+		return nil, decErr
+	}
+	ep.Tags = tags
 
 	return &ep, nil
 }

@@ -145,4 +145,10 @@ type ListFilter struct {
 	// Sort determines ordering: "created" (by created_at) or "accessed" (by accessed_at).
 	// Empty string defaults to "created".
 	Sort string `json:"sort"`
+
+	// TagsAny filters to memories containing at least one of these tags.
+	// Nil or empty means no tag filter. Values are normalized (lowercased and
+	// trimmed) before matching; an all-empty slice therefore matches nothing
+	// and is treated as "no filter".
+	TagsAny []string `json:"tags_any"`
 }

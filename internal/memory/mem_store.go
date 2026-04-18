@@ -44,6 +44,14 @@ func NewMemStore() Store {
 }
 
 func (m *memStore) InsertFact(_ context.Context, f Fact) (string, error) {
+	// Normalize + validate tags. Done outside the lock (no shared state) so a
+	// rejection doesn't hold the write mutex.
+	normTags, err := normalizeTags(f.Tags)
+	if err != nil {
+		return "", fmt.Errorf("mem store: insert fact: %w", err)
+	}
+	f.Tags = normTags
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -103,6 +111,9 @@ func (m *memStore) GetFact(_ context.Context, id string) (*Fact, error) {
 	if !ok {
 		return nil, nil
 	}
+	if f.Tags == nil {
+		f.Tags = []string{}
+	}
 	return &f, nil
 }
 
@@ -159,6 +170,13 @@ func (m *memStore) ListFacts(_ context.Context, filter ListFilter) ([]Fact, erro
 		// Subtype filter.
 		if filter.Subtype != nil && f.Subtype != *filter.Subtype {
 			continue
+		}
+		// TagsAny filter.
+		if !tagMatchesAny(f.Tags, filter.TagsAny) {
+			continue
+		}
+		if f.Tags == nil {
+			f.Tags = []string{}
 		}
 		results = append(results, f)
 	}
@@ -348,6 +366,13 @@ func (m *memStore) TickAllClusters(_ context.Context, accessedIDs []string) erro
 // --- Episode operations ---
 
 func (m *memStore) InsertEpisode(_ context.Context, e Episode) (string, error) {
+	// Normalize + validate tags outside the lock.
+	normTags, err := normalizeTags(e.Tags)
+	if err != nil {
+		return "", fmt.Errorf("mem store: insert episode: %w", err)
+	}
+	e.Tags = normTags
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -408,6 +433,10 @@ func (m *memStore) GetEpisode(_ context.Context, id string) (*Episode, error) {
 		}
 	}
 
+	if ep.Tags == nil {
+		ep.Tags = []string{}
+	}
+
 	return &ep, nil
 }
 
@@ -434,6 +463,12 @@ func (m *memStore) ListEpisodes(_ context.Context, filter ListFilter) ([]Episode
 	var results []Episode
 	for _, id := range m.episodeOrder {
 		ep := m.episodes[id]
+		if !tagMatchesAny(ep.Tags, filter.TagsAny) {
+			continue
+		}
+		if ep.Tags == nil {
+			ep.Tags = []string{}
+		}
 		results = append(results, ep)
 	}
 
