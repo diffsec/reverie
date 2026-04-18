@@ -285,11 +285,12 @@ type EpisodePayload struct {
 
 // WriteInput is the input schema for the memory_write tool.
 type WriteInput struct {
-	Content string          `json:"content,omitempty" jsonschema:"The content of the memory (required for L2 facts)"`
-	Type    string          `json:"type" jsonschema:"Memory subtype: user, feedback, project, or reference"`
-	Tags    []string        `json:"tags,omitempty" jsonschema:"Optional tags for categorization"`
-	Source  string          `json:"source,omitempty" jsonschema:"Source attribution (default: inferred)"`
-	Episode *EpisodePayload `json:"episode,omitempty" jsonschema:"if set, writes an L3 episode instead of an L2 fact"`
+	Content    string          `json:"content,omitempty" jsonschema:"The content of the memory (required for L2 facts)"`
+	Type       string          `json:"type" jsonschema:"Memory subtype: user, feedback, project, or reference"`
+	Tags       []string        `json:"tags,omitempty" jsonschema:"Optional tags for categorization"`
+	Source     string          `json:"source,omitempty" jsonschema:"Source attribution (default: inferred)"`
+	Confidence *float64        `json:"confidence,omitempty" jsonschema:"Confidence in [0,1]; defaults to 1.0. Facts only — rejected for episodes."`
+	Episode    *EpisodePayload `json:"episode,omitempty" jsonschema:"if set, writes an L3 episode instead of an L2 fact"`
 }
 
 // WriteOutput is the output schema for the memory_write tool.
@@ -318,6 +319,17 @@ func (s *Server) handleWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 
 	if !validSubtypes[in.Type] {
 		return nil, WriteOutput{}, fmt.Errorf("invalid type %q: must be one of user, feedback, project, reference", in.Type)
+	}
+
+	// Confidence is a fact-only field. Reject it on episode writes rather than
+	// silently dropping (same bug-avoidance policy as 1D tags wiring).
+	if in.Confidence != nil {
+		if hasEpisode {
+			return nil, WriteOutput{}, fmt.Errorf("confidence is not supported for episode writes")
+		}
+		if *in.Confidence < 0.0 || *in.Confidence > 1.0 {
+			return nil, WriteOutput{}, fmt.Errorf("confidence %v out of range [0,1]", *in.Confidence)
+		}
 	}
 
 	if hasEpisode {
@@ -409,6 +421,11 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 	h := sha256.Sum256([]byte(in.Content))
 	contentHash := fmt.Sprintf("%x", h)
 
+	confidence := 1.0
+	if in.Confidence != nil {
+		confidence = *in.Confidence
+	}
+
 	fact := memory.Fact{
 		Content:     in.Content,
 		ContentHash: contentHash,
@@ -416,7 +433,7 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 		Subtype:     in.Type,
 		Source:      source,
 		Embedding:   vec,
-		Confidence:  1.0,
+		Confidence:  confidence,
 		Tags:        in.Tags,
 	}
 

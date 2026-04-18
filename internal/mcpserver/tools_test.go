@@ -4090,3 +4090,87 @@ func TestHandleUpdateContent_EmptyID(t *testing.T) {
 		t.Fatalf("err = %v, want 'id is required'", err)
 	}
 }
+
+// --- memory_write confidence tests (Phase 3B) ---
+
+func TestHandleWrite_ConfidenceCustom(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["confident fact"] = []float32{0.5, 0.5, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	conf := 0.7
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content:    "confident fact",
+		Type:       "project",
+		Confidence: &conf,
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	f, err := s.store.GetFact(ctx, out.ID)
+	if err != nil || f == nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if f.Confidence != 0.7 {
+		t.Errorf("Confidence = %v, want 0.7", f.Confidence)
+	}
+}
+
+func TestHandleWrite_ConfidenceDefaultsToOne(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["default conf"] = []float32{0.5, 0.5, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "default conf",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+	f, _ := s.store.GetFact(ctx, out.ID)
+	if f.Confidence != 1.0 {
+		t.Errorf("Confidence = %v, want 1.0", f.Confidence)
+	}
+}
+
+func TestHandleWrite_ConfidenceOutOfRange(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	for _, bad := range []float64{-0.1, 1.5, 2.0} {
+		b := bad
+		_, _, err := s.handleWrite(context.Background(), nil, WriteInput{
+			Content:    "x",
+			Type:       "project",
+			Confidence: &b,
+		})
+		if err == nil {
+			t.Errorf("confidence %v: expected error, got nil", bad)
+		}
+	}
+}
+
+func TestHandleWrite_ConfidenceRejectedOnEpisode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	conf := 0.5
+	_, _, err := s.handleWrite(context.Background(), nil, WriteInput{
+		Type:       "feedback",
+		Confidence: &conf,
+		Episode: &EpisodePayload{
+			Situation: "s", Action: "a", Outcome: "o", Preemptive: "p",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when confidence set on episode write")
+	}
+}
