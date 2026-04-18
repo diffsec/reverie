@@ -1338,7 +1338,9 @@ func TestMemoryDecayTick_HappyPath(t *testing.T) {
 	}
 }
 
-func TestMemoryDecayTick_SessionEnd(t *testing.T) {
+// Phase 3C: SessionEnd and TurnsElapsed were removed. Sending either returns
+// an explicit error naming both flags so callers discover the breaking change.
+func TestMemoryDecayTick_RejectsRemovedFlags(t *testing.T) {
 	emb := newStubEmbedder(4)
 	emb.vectors["session end fact"] = []float32{0.5, 0.5, 0.0, 0.0}
 	s := newTestServer(emb)
@@ -1346,18 +1348,80 @@ func TestMemoryDecayTick_SessionEnd(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Write a fact so a cluster exists to tick.
+	// Write a fact so a cluster exists (not that we should reach tick logic).
 	_, _, err := s.handleWrite(ctx, nil, WriteInput{Content: "session end fact", Type: "user"})
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	_, tickOut, err := s.handleDecayTick(ctx, nil, DecayTickInput{SessionEnd: true})
+	// SessionEnd=true must be rejected.
+	_, _, err = s.handleDecayTick(ctx, nil, DecayTickInput{SessionEnd: true})
+	if err == nil {
+		t.Fatal("expected error when SessionEnd=true")
+	}
+	if !strings.Contains(err.Error(), "session_end") || !strings.Contains(err.Error(), "turns_elapsed") {
+		t.Fatalf("error should name both removed flags, got: %v", err)
+	}
+
+	// TurnsElapsed != 0 must be rejected.
+	_, _, err = s.handleDecayTick(ctx, nil, DecayTickInput{TurnsElapsed: 5})
+	if err == nil {
+		t.Fatal("expected error when TurnsElapsed=5")
+	}
+	if !strings.Contains(err.Error(), "session_end") || !strings.Contains(err.Error(), "turns_elapsed") {
+		t.Fatalf("error should name both removed flags, got: %v", err)
+	}
+}
+
+// Phase 3C: optional Note field is accepted and does not break the tick.
+func TestMemoryDecayTick_AcceptsNote(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["note fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{Content: "note fact", Type: "user"})
 	if err != nil {
-		t.Fatalf("decay tick session end: %v", err)
+		t.Fatalf("write: %v", err)
+	}
+
+	_, tickOut, err := s.handleDecayTick(ctx, nil, DecayTickInput{Note: "end-of-session cleanup"})
+	if err != nil {
+		t.Fatalf("decay tick with note: %v", err)
 	}
 	if !tickOut.Ticked {
-		t.Fatal("expected ticked=true for session end")
+		t.Fatal("expected ticked=true")
+	}
+}
+
+// Phase 3C: the session_end prompt text no longer references session_end=true.
+func TestSessionEndPrompt_NoRemovedFlagReference(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	res, err := s.handleSessionEndPrompt(ctx, nil)
+	if err != nil {
+		t.Fatalf("handleSessionEndPrompt: %v", err)
+	}
+	if res == nil || len(res.Messages) == 0 {
+		t.Fatal("expected prompt messages")
+	}
+	for _, m := range res.Messages {
+		tc, ok := m.Content.(*mcpsdk.TextContent)
+		if !ok {
+			continue
+		}
+		if strings.Contains(tc.Text, "session_end=true") {
+			t.Fatalf("prompt text must not mention session_end=true, got: %q", tc.Text)
+		}
+		if strings.Contains(tc.Text, "turns_elapsed") {
+			t.Fatalf("prompt text must not mention turns_elapsed, got: %q", tc.Text)
+		}
 	}
 }
 

@@ -56,7 +56,7 @@ Clusters with high utility are your strongest context — prioritize them.`
 func (s *Server) handleSessionEndPrompt(_ context.Context, _ *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {
 	text := `Session wrap-up.
 
-1. Call memory_decay_tick with session_end=true to advance the decay clock for all clusters.
+1. Call memory_decay_tick to advance the decay clock for all clusters.
 2. If significant work was done this session (architecture decisions, bug fixes, new patterns learned), write an L3 episode summarizing it:
    - Call memory_write with type="project" (or "feedback" for process lessons) and an episode payload:
      - situation: what triggered the work

@@ -945,9 +945,21 @@ func (s *Server) handleApplyJudgment(ctx context.Context, _ *mcpsdk.CallToolRequ
 // --- memory_decay_tick ---
 
 // DecayTickInput is the input schema for the memory_decay_tick tool.
+//
+// Phase 3C: turns_elapsed and session_end were removed because they had no
+// effect on behavior. They are retained here solely to detect callers that
+// still send the old shape so we can return an explicit error naming the
+// removed flags — the MCP SDK's JSON decoder silently drops unknown fields,
+// so pure deletion would leave callers with a confusing no-op. The Note
+// field is purely an optional audit annotation; it does not influence the
+// tick.
 type DecayTickInput struct {
-	TurnsElapsed int  `json:"turns_elapsed,omitempty" jsonschema:"Number of turns elapsed (ignored in Phase 2)"`
-	SessionEnd   bool `json:"session_end,omitempty" jsonschema:"If true, treat as session-end tick (bumps all clusters)"`
+	Note string `json:"note,omitempty" jsonschema:"optional log annotation"`
+
+	// Deprecated-rejected: these fields were removed in Phase 3C. Setting
+	// either returns an error. Do not read these values elsewhere.
+	TurnsElapsed int  `json:"turns_elapsed,omitempty" jsonschema:"removed in Phase 3C; setting returns an error"`
+	SessionEnd   bool `json:"session_end,omitempty" jsonschema:"removed in Phase 3C; setting returns an error"`
 }
 
 // DecayTickOutput is the output schema for the memory_decay_tick tool.
@@ -1034,8 +1046,10 @@ func (s *Server) handleDecayTick(ctx context.Context, _ *mcpsdk.CallToolRequest,
 		}, DecayTickOutput{}, nil
 	}
 
-	if in.SessionEnd {
-		s.logger.Info("memory_decay_tick: session end, ticking all clusters")
+	// Phase 3C: reject old-shape callers explicitly so they discover the
+	// breaking change instead of experiencing a silent no-op.
+	if in.SessionEnd || in.TurnsElapsed != 0 {
+		return nil, DecayTickOutput{}, fmt.Errorf("memory_decay_tick: the session_end and turns_elapsed fields were removed in Phase 3C; call memory_decay_tick without arguments")
 	}
 
 	// TickDecay with nil accessedIDs bumps all clusters with none reset.
@@ -1043,7 +1057,11 @@ func (s *Server) handleDecayTick(ctx context.Context, _ *mcpsdk.CallToolRequest,
 		return nil, DecayTickOutput{}, fmt.Errorf("tick decay: %w", err)
 	}
 
-	s.logger.Info("memory_decay_tick", "session_end", in.SessionEnd)
+	if in.Note != "" {
+		s.logger.Info("memory_decay_tick", "note", in.Note)
+	} else {
+		s.logger.Info("memory_decay_tick")
+	}
 	return nil, DecayTickOutput{Ticked: true}, nil
 }
 
