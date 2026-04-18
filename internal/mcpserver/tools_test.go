@@ -1972,3 +1972,185 @@ func TestHandleWrite_FactTagsListable(t *testing.T) {
 		t.Errorf("content = %q, want 'listable fact'", got[0].Content)
 	}
 }
+
+// TestHandleRecall_IncludesClusterIDAndTags verifies that each recall candidate
+// carries the underlying memory's cluster_id and tags (both fact and episode
+// paths).
+func TestHandleRecall_IncludesClusterIDAndTags(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["tagged fact for recall"] = []float32{0.5, 0.5, 0.0, 0.0}
+	// Episode embedding uses the raw fields concatenated with \n (see writeEpisode).
+	emb.vectors["sit1\nact1\nout1\npre1"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["recall query"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, factOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "tagged fact for recall",
+		Type:    "project",
+		Tags:    []string{"alpha", "beta"},
+	})
+	if err != nil {
+		t.Fatalf("write fact: %v", err)
+	}
+
+	_, epOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Tags: []string{"gamma"},
+		Episode: &EpisodePayload{
+			Situation:  "sit1",
+			Action:     "act1",
+			Outcome:    "out1",
+			Preemptive: "pre1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("write episode: %v", err)
+	}
+
+	_, recallOut, err := s.handleRecall(ctx, nil, RecallInput{Query: "recall query", Limit: 10})
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+
+	var sawFact, sawEp bool
+	for _, c := range recallOut.Candidates {
+		if c.ClusterID == "" {
+			t.Errorf("candidate %s has empty cluster_id", c.ID)
+		}
+		switch c.ID {
+		case factOut.ID:
+			sawFact = true
+			if len(c.Tags) != 2 || c.Tags[0] != "alpha" || c.Tags[1] != "beta" {
+				t.Errorf("fact candidate tags = %v, want [alpha beta]", c.Tags)
+			}
+			// Verify cluster_id matches underlying fact.
+			f, ferr := s.store.GetFact(ctx, factOut.ID)
+			if ferr != nil || f == nil {
+				t.Fatalf("GetFact: %v", ferr)
+			}
+			if c.ClusterID != f.ClusterID {
+				t.Errorf("fact candidate cluster_id = %q, want %q", c.ClusterID, f.ClusterID)
+			}
+		case epOut.ID:
+			sawEp = true
+			if len(c.Tags) != 1 || c.Tags[0] != "gamma" {
+				t.Errorf("episode candidate tags = %v, want [gamma]", c.Tags)
+			}
+			ep, eerr := s.store.GetEpisode(ctx, epOut.ID)
+			if eerr != nil || ep == nil {
+				t.Fatalf("GetEpisode: %v", eerr)
+			}
+			if c.ClusterID != ep.ClusterID {
+				t.Errorf("episode candidate cluster_id = %q, want %q", c.ClusterID, ep.ClusterID)
+			}
+		}
+	}
+	if !sawFact {
+		t.Error("did not see fact candidate in recall output")
+	}
+	if !sawEp {
+		t.Error("did not see episode candidate in recall output")
+	}
+}
+
+// TestHandleRecall_TagsNonNilForUntagged verifies the tags field is a non-nil
+// slice on recall candidates even when the underlying memory has no tags.
+// The Go-level struct carries an empty []string{} so callers can range over it
+// safely; JSON serialization with omitempty may drop it, matching 1A's behavior.
+func TestHandleRecall_TagsNonNilForUntagged(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["untagged recall fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["q"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "untagged recall fact",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, recallOut, err := s.handleRecall(ctx, nil, RecallInput{Query: "q", Limit: 5})
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+	if len(recallOut.Candidates) == 0 {
+		t.Fatal("expected at least one candidate")
+	}
+	for _, c := range recallOut.Candidates {
+		if c.Tags == nil {
+			t.Errorf("candidate %s has nil Tags; expected empty slice", c.ID)
+		}
+	}
+}
+
+// TestHandleRecall_LinkedIDsRegression guards the 1A-pre-existing linked_ids
+// behavior: fact↔episode links remain populated on recall candidates after
+// the 1B additions.
+func TestHandleRecall_LinkedIDsRegression(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["linked fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["sitX\nactX\noutX\npreX"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["link query"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, factOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "linked fact",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("write fact: %v", err)
+	}
+
+	_, epOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "project",
+		Episode: &EpisodePayload{
+			Situation:     "sitX",
+			Action:        "actX",
+			Outcome:       "outX",
+			Preemptive:    "preX",
+			LinkedFactIDs: []string{factOut.ID},
+		},
+	})
+	if err != nil {
+		t.Fatalf("write episode: %v", err)
+	}
+
+	_, recallOut, err := s.handleRecall(ctx, nil, RecallInput{Query: "link query", Limit: 10})
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+
+	var factLinkedToEp, epLinkedToFact bool
+	for _, c := range recallOut.Candidates {
+		switch c.ID {
+		case factOut.ID:
+			for _, lid := range c.LinkedIDs {
+				if lid == epOut.ID {
+					factLinkedToEp = true
+				}
+			}
+		case epOut.ID:
+			for _, lid := range c.LinkedIDs {
+				if lid == factOut.ID {
+					epLinkedToFact = true
+				}
+			}
+		}
+	}
+	if !factLinkedToEp {
+		t.Error("fact candidate missing linked episode ID")
+	}
+	if !epLinkedToFact {
+		t.Error("episode candidate missing linked fact ID")
+	}
+}

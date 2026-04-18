@@ -43,6 +43,8 @@ type RecallCandidate struct {
 	GateBPass  bool     `json:"gate_b_pass"`
 	GateCPass  bool     `json:"gate_c_pass"`
 	LinkedIDs  []string `json:"linked_ids,omitempty"`
+	ClusterID  string   `json:"cluster_id"`
+	Tags       []string `json:"tags,omitempty"`
 }
 
 // RecallOutput is the output schema for the memory_recall tool.
@@ -118,11 +120,17 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 			Retention:  retention,
 			GateBPass:  float64(c.Similarity) > threshold,
 			GateCPass:  gateCPass,
+			ClusterID:  clusterID,
 		}
 
-		// Set subtype for facts only.
+		// Set subtype and tags for facts; tags for episodes.
 		if c.Fact != nil {
 			rc.Subtype = c.Fact.Subtype
+			rc.Tags = normalizeTagsSlice(c.Fact.Tags)
+		} else if c.Episode != nil {
+			rc.Tags = normalizeTagsSlice(c.Episode.Tags)
+		} else {
+			rc.Tags = normalizeTagsSlice(nil)
 		}
 
 		// Fetch cross-type linked IDs.
