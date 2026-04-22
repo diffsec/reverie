@@ -1074,3 +1074,160 @@ func TestStatusResource_CacheHitsAndMissesTracked(t *testing.T) {
 		t.Errorf("hit_rate = %v, want in [0,1]", after.EmbeddingCache.HitRate)
 	}
 }
+
+// --- reverie://sessions/{id} (Phase 6d) ---
+
+// readSessionResource is a small helper that builds the ReadResourceRequest,
+// invokes the handler, and returns (result, err). Keeps the test bodies
+// focused on the shape assertions.
+func readSessionResource(t *testing.T, s *Server, uri string) (*mcpsdk.ReadResourceResult, error) {
+	t.Helper()
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: uri}
+	return s.handleSessionResource(context.Background(), req)
+}
+
+func TestSessionResource_Active_ReturnsCorrectShape(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["session-fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	const sessID = "resource-active"
+	if err := s.store.CreateSession(ctx, memory.Session{
+		ID:          sessID,
+		ProjectHint: "reverie",
+		Tags:        []string{"phase6", "resource"},
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Seed the buffer via a session-scoped write so the resource has
+	// something non-empty to render.
+	_, writeOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "session-fact", Type: "project", SessionID: sessID,
+	})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	result, err := readSessionResource(t, s, "reverie://sessions/"+sessID)
+	if err != nil {
+		t.Fatalf("handleSessionResource: %v", err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(result.Contents))
+	}
+
+	var resp sessionResourceResponse
+	if err := json.Unmarshal([]byte(result.Contents[0].Text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.SessionID != sessID {
+		t.Errorf("SessionID = %q, want %q", resp.SessionID, sessID)
+	}
+	if resp.ProjectHint != "reverie" {
+		t.Errorf("ProjectHint = %q, want reverie", resp.ProjectHint)
+	}
+	if len(resp.Tags) != 2 || resp.Tags[0] != "phase6" || resp.Tags[1] != "resource" {
+		t.Errorf("Tags = %v, want [phase6 resource]", resp.Tags)
+	}
+	if len(resp.Buffer) != 1 {
+		t.Fatalf("Buffer len = %d, want 1", len(resp.Buffer))
+	}
+	if resp.Buffer[0].ID != writeOut.ID {
+		t.Errorf("Buffer[0].ID = %q, want %q", resp.Buffer[0].ID, writeOut.ID)
+	}
+	if resp.CreatedAt == "" {
+		t.Error("CreatedAt should be populated")
+	}
+	if resp.UpdatedAt == "" {
+		t.Error("UpdatedAt should be populated")
+	}
+	if resp.ClosedAt != nil {
+		t.Errorf("ClosedAt should be nil for active session, got %q", *resp.ClosedAt)
+	}
+	if resp.BufferBudget.Used != 1 {
+		t.Errorf("BufferBudget.Used = %d, want 1", resp.BufferBudget.Used)
+	}
+	// Config default = 50 from config.Defaults().
+	if resp.BufferBudget.Max <= 0 {
+		t.Errorf("BufferBudget.Max = %d, want positive", resp.BufferBudget.Max)
+	}
+
+	// Verify JSON empty-slice invariant for Tags (never null). Done against
+	// a fresh sans-tags session below in a dedicated test.
+}
+
+func TestSessionResource_Closed_PopulatesClosedAt(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	const sessID = "resource-closed"
+	if err := s.store.CreateSession(ctx, memory.Session{ID: sessID}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.store.CloseSession(ctx, sessID); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+
+	result, err := readSessionResource(t, s, "reverie://sessions/"+sessID)
+	if err != nil {
+		t.Fatalf("handleSessionResource: %v", err)
+	}
+
+	var resp sessionResourceResponse
+	if err := json.Unmarshal([]byte(result.Contents[0].Text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.ClosedAt == nil {
+		t.Fatal("ClosedAt should be populated on a closed session")
+	}
+	if *resp.ClosedAt == "" {
+		t.Error("ClosedAt should be a non-empty ISO8601 timestamp")
+	}
+	if resp.SessionID != sessID {
+		t.Errorf("SessionID = %q, want %q", resp.SessionID, sessID)
+	}
+	// Tags must be a non-nil empty slice so JSON encodes as [] not null.
+	if resp.Tags == nil {
+		t.Error("Tags should be non-nil (empty slice)")
+	}
+	if len(resp.Buffer) != 0 {
+		t.Errorf("Buffer len = %d, want 0 on unseeded closed session", len(resp.Buffer))
+	}
+}
+
+func TestSessionResource_UnknownID_Errors(t *testing.T) {
+	s := newTestServer(newStubEmbedder(4))
+	defer s.recallCache.stop()
+
+	_, err := readSessionResource(t, s, "reverie://sessions/does-not-exist")
+	if err == nil {
+		t.Fatal("expected error for unknown session id")
+	}
+	if !strings.Contains(err.Error(), "session not found") {
+		t.Errorf("error %q should mention 'session not found'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("error %q should include the queried id", err.Error())
+	}
+}
+
+func TestSessionResource_EmptyID_Errors(t *testing.T) {
+	s := newTestServer(newStubEmbedder(4))
+	defer s.recallCache.stop()
+
+	_, err := readSessionResource(t, s, "reverie://sessions/")
+	if err == nil {
+		t.Fatal("expected error for empty session id")
+	}
+	if !strings.Contains(err.Error(), "session id is required") {
+		t.Errorf("error %q should say session id is required", err.Error())
+	}
+}

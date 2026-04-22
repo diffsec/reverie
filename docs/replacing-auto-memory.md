@@ -2,14 +2,26 @@
 
 ## Background
 
-Claude Code has a built-in auto-memory system that stores memories as markdown files in `~/.claude/projects/<project>/memory/`. It works but has limitations:
+Claude Code has a built-in auto-memory system that stores memories as markdown files in `~/.claude/projects/<project>/memory/`. A single "conversation file" per conversation accumulates notes that later sessions re-read wholesale. It works but has limitations:
 
 - **Code-only**: memories are not accessible from Claude Desktop or custom API harnesses.
 - **No recall logic**: all memories are injected into context every session (no search, no ranking).
 - **No decay**: memories accumulate forever with no staleness filtering.
 - **No structured types**: no distinction between facts and episodes, no cross-references.
+- **Opaque per-conversation state**: the "conversation file" is a single flat blob — no notion of which memories were actually in play, no resume semantics, no way to inspect prior session buffers from another harness.
 
-Reverie replaces this with a proper memory system: vector search, Ebbinghaus decay, three memory layers, and MCP-based access from any client.
+Reverie replaces this with a proper memory system: vector search, Ebbinghaus decay, three memory layers, MCP-based access from any client, and **persistent sessions** (Phase 6) that replace the per-conversation auto-memory file with a structured, resumable working-memory buffer.
+
+### Sessions replace the conversation file
+
+Where auto-memory kept per-conversation notes in a markdown file, reverie models a session as first-class state:
+
+- `memory_session_init(session_id, project_hint, tags)` at the start of a conversation creates (or resumes) a named session. If the session already exists, its prior working-memory buffer — the L2/L3 memories that were in play — is returned so the agent can resume with context intact.
+- `memory_recall`, `memory_write`, `memory_reinforce`, and `memory_apply_judgment` all accept an optional `session_id`. When supplied, the session buffer auto-updates on each call (bounded by the configured budget, evicting lowest-score entries first).
+- `memory_session_end(session_id, episode?)` closes the session. It runs a scoped decay tick limited to clusters touched this session (instead of bumping every cluster globally), optionally writes an L3 episode summarizing the conversation, and marks the session read-only.
+- `reverie://sessions/{id}` reads back a session's buffer, metadata, and budget state from any MCP client — active or closed sessions are both readable.
+
+Sessions are opt-in: all existing tools keep working without a `session_id`. But when adopted, they give you what the auto-memory conversation file never did — a structured, recall-aware, resumable working memory.
 
 ## Step 1: Add the CLAUDE.md preamble
 
@@ -19,6 +31,12 @@ Append the following to `~/.claude/CLAUDE.md` (after any existing content):
 ## Memory — Reverie
 
 All persistent memory goes through the `reverie` MCP server. Do not write to ~/.claude/projects/*/memory/ files — that system is disabled.
+
+### Session lifecycle (replaces the per-conversation file)
+- At the start of each conversation, call `memory_session_init` with a stable `session_id` (e.g., project name + date) and an optional `project_hint`. If the session already exists, its prior buffer comes back — treat it as already-loaded working memory.
+- Pass that `session_id` into every subsequent `memory_recall` / `memory_apply_judgment` / `memory_reinforce` / `memory_write`. The buffer auto-updates under a bounded budget.
+- At the end of a conversation, call `memory_session_end` with the `session_id`, optionally with an `episode` payload summarizing significant work. This runs a scoped decay tick and closes the session.
+- The `session_start` and `session_end` prompts encode the full lifecycle.
 
 ### Recall
 - At session start, call `memory_recall` with the project/task context. Prefer reading `reverie://l1/index` before your first recall.

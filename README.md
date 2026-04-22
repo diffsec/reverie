@@ -115,13 +115,17 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 
 | Tool | Purpose | When to call |
 |---|---|---|
-| `memory_recall` | Search memory by query. Returns ranked candidates with gate pass flags. | Session start; before architectural decisions; when referencing prior context. |
-| `memory_write` | Store a new fact (L2) or episode (L3). | When the caller decides something is durable knowledge. |
-| `memory_apply_judgment` | Apply Gate A verdicts from a subagent judge to a recall result. | After `memory_recall` when >5 candidates or staleness matters. |
-| `memory_reinforce` | Boost utility of memories actually used in a response. | After using recalled memories. |
+| `memory_recall` | Search memory by query. Returns ranked candidates with gate pass flags. Accepts optional `session_id` to auto-update the session buffer. | Session start; before architectural decisions; when referencing prior context. |
+| `memory_write` | Store a new fact (L2) or episode (L3). Accepts optional `session_id`. | When the caller decides something is durable knowledge. |
+| `memory_apply_judgment` | Apply Gate A verdicts from a subagent judge to a recall result. Accepts optional `session_id`. | After `memory_recall` when >5 candidates or staleness matters. |
+| `memory_reinforce` | Boost utility of memories actually used in a response. Accepts optional `session_id`. | After using recalled memories. |
 | `memory_forget` | Delete by ID, or search for deletion candidates by query. | On correction; on explicit "forget X". |
 | `memory_list` | Browse/audit memories with filtering and pagination. | Inspection. |
-| `memory_decay_tick` | Advance the decay clock (internal). | Session-end hooks; not called by agents directly. |
+| `memory_decay_tick` | Advance the decay clock (internal). | Scheduled jobs; not called by agents directly. Use `memory_session_end` for session-scoped ticks. |
+| `memory_session_init` | Create or resume a named session; returns the persisted working-memory buffer. | At the start of every conversation that wants resumable memory. |
+| `memory_session_snapshot` | Force-flush the current buffer to the session store. | Explicit checkpoint; normally implicit after each mutation. |
+| `memory_session_restore` | Read the buffer and metadata for a session without `init` semantics. | Inspection / audit. |
+| `memory_session_end` | Close a session, run a scoped decay tick, optionally write an L3 episode. | End of conversation. |
 
 ## Resources
 
@@ -129,14 +133,18 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 |---|---|
 | `reverie://status` | Counts per layer, last decay, DB size, cache hit rate. |
 | `reverie://l1/index` | L1 cluster meta-index -- always-resident procedural memory. |
-| `reverie://l3/recent?n=10` | Recent episodic traces. |
+| `reverie://l1/cluster/{id}` | Per-cluster metadata + paginated members (facts + episodes). |
+| `reverie://l1/at_risk` | Clusters with retention below threshold, most-at-risk first. |
+| `reverie://l3/recent` | Recent episodic traces. |
+| `reverie://stats/daily` | Per-day facts/episodes in/out + supersedes. |
+| `reverie://sessions/{id}` | Per-session working-memory buffer, metadata, and budget. |
 
 ## Prompts
 
 | Name | Purpose |
 |---|---|
-| `session_start` | Recall with project-scoped query + attach L1 index. |
-| `session_end` | Consolidate L3 + force a decay tick. |
+| `session_start` | Walk through `memory_session_init` + `reverie://l1/index` + session-scoped `memory_recall`. Takes `session_id` (required) and `project_hint` (optional). |
+| `session_end` | Walk through `memory_session_end` (with optional episode payload). Takes `session_id` (required). |
 
 ## Configuration
 

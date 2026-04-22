@@ -60,6 +60,13 @@ func (s *Server) registerResources(srv *mcpsdk.Server) {
 		Description: "Per-day counters for facts in/out, episodes in/out, and supersedes, maintained by DB triggers. Dates are UTC YYYY-MM-DD. Defaults: from = today-30 days, to = today. Gaps are zero-filled. Max span 365 days.",
 		MIMEType:    "application/json",
 	}, s.handleStatsDailyResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "reverie://sessions/{id}",
+		Name:        "Session Working Memory",
+		Description: "Per-session working memory snapshot: buffer, project hint, tags, timestamps, and budget. Active and closed sessions are both readable (ClosedAt is populated for closed sessions).",
+		MIMEType:    "application/json",
+	}, s.handleSessionResource)
 }
 
 // --- reverie://status ---
@@ -859,6 +866,92 @@ func (s *Server) handleStatsDailyResource(ctx context.Context, req *mcpsdk.ReadR
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return nil, fmt.Errorf("stats daily: marshal: %w", err)
+	}
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(data),
+		}},
+	}, nil
+}
+
+// --- reverie://sessions/{id} ---
+
+// sessionResourceResponse is the JSON structure for the per-session resource.
+// Shape is specified in Phase 6d of docs/design/phase-6-working-memory.md:
+// mirrors SessionRestoreOutput but adds UpdatedAt (always present) and a
+// BufferBudget subsection so a reader can tell how close the buffer is to its
+// configured cap without knowing the config. Closed sessions are readable —
+// the ClosedAt pointer is populated rather than the handler erroring.
+type sessionResourceResponse struct {
+	SessionID    string             `json:"session_id"`
+	Buffer       []memory.MemoryRef `json:"buffer"`
+	ProjectHint  string             `json:"project_hint"`
+	Tags         []string           `json:"tags"`
+	CreatedAt    string             `json:"created_at"`
+	UpdatedAt    string             `json:"updated_at"`
+	ClosedAt     *string            `json:"closed_at,omitempty"`
+	BufferBudget struct {
+		Used int `json:"used"`
+		Max  int `json:"max"`
+	} `json:"buffer_budget"`
+}
+
+// parseSessionResourceURI extracts the session id from a
+// reverie://sessions/{id} URI. No query params are supported. An empty id
+// after trimming is an error. Unlike parseClusterDetailURI, the session URI
+// pattern puts the collection in the URL host (`sessions`) rather than in the
+// path prefix (`/cluster/`), so we just trim the leading `/` from the path.
+func parseSessionResourceURI(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid uri: %w", err)
+	}
+	if u.Host != "sessions" {
+		return "", fmt.Errorf("invalid uri host: %q (want sessions)", u.Host)
+	}
+	id := strings.Trim(u.Path, "/")
+	if id == "" {
+		return "", fmt.Errorf("session id is required")
+	}
+	return id, nil
+}
+
+func (s *Server) handleSessionResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	id, err := parseSessionResourceURI(req.Params.URI)
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("session resource: get session: %w", err)
+	}
+	if sess == nil {
+		return nil, fmt.Errorf("session not found: %s", id)
+	}
+
+	buf := sess.WorkingMem.Buffer
+	if buf == nil {
+		buf = []memory.MemoryRef{}
+	}
+
+	resp := sessionResourceResponse{
+		SessionID:   sess.ID,
+		Buffer:      buf,
+		ProjectHint: sess.ProjectHint,
+		Tags:        normalizeTagsSlice(sess.Tags),
+		CreatedAt:   formatSessionTime(sess.CreatedAt),
+		UpdatedAt:   formatSessionTime(sess.UpdatedAt),
+		ClosedAt:    formatSessionTimePtr(sess.ClosedAt),
+	}
+	resp.BufferBudget.Used = len(buf)
+	resp.BufferBudget.Max = sess.WorkingMem.BudgetMax
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("session resource: marshal: %w", err)
 	}
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{
