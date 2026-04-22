@@ -284,4 +284,52 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 			Title:         "List memory links",
 		},
 	}, s.handleListLinks)
+
+	// --- Phase 6c session tools ---
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_session_init",
+		Description: "Open or resume a session. Creates a new session row if session_id is unknown; otherwise returns the persisted buffer for resume. " +
+			"On resume, project_hint replaces (if non-empty) and tags merge with the existing set. " +
+			"Closed sessions cannot be resumed — a fresh session_id is required.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Initialize or resume a session",
+		},
+	}, s.handleSessionInit)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_session_snapshot",
+		Description: "Force a checkpoint write of the current session buffer. Normally implicit after each mutation; " +
+			"call this tool to request an explicit persist, e.g. before the harness checkpoints itself.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Checkpoint session buffer",
+		},
+	}, s.handleSessionSnapshot)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_session_restore",
+		Description: "Read the persisted state for a session: buffer, tags, project_hint, updated_at, and closed_at. " +
+			"Pure read — does not reopen a closed session. Use session_init for the create/resume path.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: &openWorld,
+			Title:         "Restore session state",
+		},
+	}, s.handleSessionRestore)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "memory_session_end",
+		Description: "Close a session. Runs a scoped decay tick (bumps all clusters, resets turns_since to 0 only for clusters referenced by the session buffer), optionally writes an L3 episode summary (auto-tagged 'session:<id>', auto-linked to every fact in the buffer), and marks the session closed. Closed sessions are read-only.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "End a session",
+		},
+	}, s.handleSessionEnd)
 }

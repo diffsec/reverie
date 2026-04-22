@@ -2307,3 +2307,435 @@ func (s *Server) handleListLinks(ctx context.Context, _ *mcpsdk.CallToolRequest,
 
 	return nil, ListLinksOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
 }
+
+// --- Session tools (Phase 6c) ---
+//
+// The four handlers below expose the session lifecycle: init (create or
+// resume), snapshot (explicit checkpoint), restore (pure read), and end
+// (scoped decay tick + optional episode + close). They reuse applySession-
+// Mutation / AppendToBuffer / etc. for the buffer plumbing — see
+// session_helpers.go and internal/memory/session_buffer.go.
+
+// sessionTimeFormat is the ISO8601 UTC format emitted in session tool outputs.
+// Matches the design doc's fixed-width "2006-01-02T15:04:05Z" (no sub-second,
+// always Z) so harness-side parsing stays simple.
+const sessionTimeFormat = "2006-01-02T15:04:05Z"
+
+// formatSessionTime renders t as ISO8601 UTC. Zero times are rendered as an
+// empty string so callers can detect "not set" without importing time.
+func formatSessionTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(sessionTimeFormat)
+}
+
+// formatSessionTimePtr returns a *string formatted per formatSessionTime, or
+// nil when the input pointer is nil. Used for ClosedAt in outputs.
+func formatSessionTimePtr(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	out := formatSessionTime(*t)
+	return &out
+}
+
+// mergeTagSlices concatenates two tag slices for handoff to the store's
+// UpdateSessionMeta, which runs normalizeTags internally (lowercase, trim,
+// dedup, sort, length-check). Either or both inputs may be nil. Used by
+// session_init when resuming with new tags — the spec calls for MERGE, not
+// REPLACE. Dedup/sort happen inside the store; we just append.
+func mergeTagSlices(existing, incoming []string) []string {
+	combined := make([]string, 0, len(existing)+len(incoming))
+	combined = append(combined, existing...)
+	combined = append(combined, incoming...)
+	return combined
+}
+
+// --- memory_session_init ---
+
+// SessionInitInput is the input schema for memory_session_init.
+type SessionInitInput struct {
+	SessionID   string   `json:"session_id" jsonschema:"stable session identifier (client-generated)"`
+	ProjectHint string   `json:"project_hint,omitempty" jsonschema:"freeform hint describing the project scope (replaces on resume if non-empty)"`
+	Tags        []string `json:"tags,omitempty" jsonschema:"tags to associate with this session (merged with existing tags on resume)"`
+}
+
+// SessionInitOutput is the output schema for memory_session_init.
+type SessionInitOutput struct {
+	SessionID   string             `json:"session_id"`
+	Created     bool               `json:"created"`
+	Buffer      []memory.MemoryRef `json:"buffer"`
+	ProjectHint string             `json:"project_hint"`
+	Tags        []string           `json:"tags"`
+	CreatedAt   string             `json:"created_at"`
+	ClosedAt    *string            `json:"closed_at,omitempty"`
+}
+
+func (s *Server) handleSessionInit(ctx context.Context, _ *mcpsdk.CallToolRequest, in SessionInitInput) (*mcpsdk.CallToolResult, SessionInitOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, SessionInitOutput{}, nil
+	}
+
+	if in.SessionID == "" {
+		return nil, SessionInitOutput{}, fmt.Errorf("session_id is required")
+	}
+
+	existing, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil {
+		return nil, SessionInitOutput{}, fmt.Errorf("get session: %w", err)
+	}
+
+	if existing == nil {
+		// New session: insert with an empty buffer sized to the current budget.
+		budgetMax := s.bufferBudgetMax()
+		sess := memory.Session{
+			ID:          in.SessionID,
+			ProjectHint: in.ProjectHint,
+			Tags:        in.Tags,
+			WorkingMem: memory.WorkingMemory{
+				Buffer:    []memory.MemoryRef{},
+				BudgetMax: budgetMax,
+			},
+		}
+		if err := s.store.CreateSession(ctx, sess); err != nil {
+			return nil, SessionInitOutput{}, fmt.Errorf("create session: %w", err)
+		}
+		// Re-fetch so the server-assigned timestamps are authoritative.
+		created, err := s.store.GetSession(ctx, in.SessionID)
+		if err != nil || created == nil {
+			return nil, SessionInitOutput{}, fmt.Errorf("reload created session: %w", err)
+		}
+		s.logger.Info("memory_session_init", "session_id", in.SessionID, "created", true)
+		return nil, SessionInitOutput{
+			SessionID:   created.ID,
+			Created:     true,
+			Buffer:      []memory.MemoryRef{},
+			ProjectHint: created.ProjectHint,
+			Tags:        normalizeTagsSlice(created.Tags),
+			CreatedAt:   formatSessionTime(created.CreatedAt),
+			ClosedAt:    nil,
+		}, nil
+	}
+
+	// Existing session.
+	if existing.ClosedAt != nil {
+		return nil, SessionInitOutput{}, fmt.Errorf("session closed, cannot resume: %s", in.SessionID)
+	}
+
+	// Resume: merge project_hint (replace if non-empty) and tags (union).
+	newProjectHint := existing.ProjectHint
+	if in.ProjectHint != "" {
+		newProjectHint = in.ProjectHint
+	}
+
+	mergedTags := existing.Tags
+	// Only touch tags when the caller actually provided them (non-nil).
+	if in.Tags != nil {
+		mergedTags = mergeTagSlices(existing.Tags, in.Tags)
+	}
+
+	// Write meta only if something changed. This keeps updated_at stable for
+	// no-op resumes (which matters for downstream tooling that watches it).
+	if newProjectHint != existing.ProjectHint || in.Tags != nil {
+		if err := s.store.UpdateSessionMeta(ctx, in.SessionID, newProjectHint, mergedTags); err != nil {
+			return nil, SessionInitOutput{}, fmt.Errorf("update session meta: %w", err)
+		}
+	}
+
+	// Pull fresh state so the output reflects any meta update.
+	resumed, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil || resumed == nil {
+		return nil, SessionInitOutput{}, fmt.Errorf("reload resumed session: %w", err)
+	}
+
+	buf := resumed.WorkingMem.Buffer
+	if buf == nil {
+		buf = []memory.MemoryRef{}
+	}
+
+	s.logger.Info("memory_session_init", "session_id", in.SessionID, "created", false, "buffer_len", len(buf))
+	return nil, SessionInitOutput{
+		SessionID:   resumed.ID,
+		Created:     false,
+		Buffer:      buf,
+		ProjectHint: resumed.ProjectHint,
+		Tags:        normalizeTagsSlice(resumed.Tags),
+		CreatedAt:   formatSessionTime(resumed.CreatedAt),
+		ClosedAt:    formatSessionTimePtr(resumed.ClosedAt),
+	}, nil
+}
+
+// --- memory_session_snapshot ---
+
+// SessionSnapshotInput is the input schema for memory_session_snapshot.
+type SessionSnapshotInput struct {
+	SessionID string `json:"session_id" jsonschema:"session to checkpoint"`
+}
+
+// SessionSnapshotOutput is the output schema for memory_session_snapshot.
+type SessionSnapshotOutput struct {
+	Persisted bool   `json:"persisted"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func (s *Server) handleSessionSnapshot(ctx context.Context, _ *mcpsdk.CallToolRequest, in SessionSnapshotInput) (*mcpsdk.CallToolResult, SessionSnapshotOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, SessionSnapshotOutput{}, nil
+	}
+
+	if in.SessionID == "" {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("session_id is required")
+	}
+
+	sess, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("get session: %w", err)
+	}
+	if sess == nil {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("session not found: %s", in.SessionID)
+	}
+	if sess.ClosedAt != nil {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("session closed: %s", in.SessionID)
+	}
+
+	// Idempotent checkpoint: persist the current buffer even if it hasn't
+	// changed. UpdateSessionBuffer bumps updated_at unconditionally so the
+	// caller can observe that the checkpoint landed.
+	if err := s.store.UpdateSessionBuffer(ctx, in.SessionID, sess.WorkingMem); err != nil {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("update session buffer: %w", err)
+	}
+
+	// Re-read so the new updated_at is authoritative (the server assigns it).
+	fresh, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil || fresh == nil {
+		return nil, SessionSnapshotOutput{}, fmt.Errorf("reload session after snapshot: %w", err)
+	}
+
+	s.logger.Info("memory_session_snapshot", "session_id", in.SessionID, "buffer_len", len(fresh.WorkingMem.Buffer))
+	return nil, SessionSnapshotOutput{
+		Persisted: true,
+		UpdatedAt: formatSessionTime(fresh.UpdatedAt),
+	}, nil
+}
+
+// --- memory_session_restore ---
+
+// SessionRestoreInput is the input schema for memory_session_restore.
+type SessionRestoreInput struct {
+	SessionID string `json:"session_id" jsonschema:"session to load"`
+}
+
+// SessionRestoreOutput is the output schema for memory_session_restore.
+type SessionRestoreOutput struct {
+	Buffer      []memory.MemoryRef `json:"buffer"`
+	ProjectHint string             `json:"project_hint"`
+	Tags        []string           `json:"tags"`
+	UpdatedAt   string             `json:"updated_at"`
+	ClosedAt    *string            `json:"closed_at,omitempty"`
+}
+
+func (s *Server) handleSessionRestore(ctx context.Context, _ *mcpsdk.CallToolRequest, in SessionRestoreInput) (*mcpsdk.CallToolResult, SessionRestoreOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, SessionRestoreOutput{}, nil
+	}
+
+	if in.SessionID == "" {
+		return nil, SessionRestoreOutput{}, fmt.Errorf("session_id is required")
+	}
+
+	sess, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil {
+		return nil, SessionRestoreOutput{}, fmt.Errorf("get session: %w", err)
+	}
+	if sess == nil {
+		return nil, SessionRestoreOutput{}, fmt.Errorf("session not found: %s", in.SessionID)
+	}
+
+	buf := sess.WorkingMem.Buffer
+	if buf == nil {
+		buf = []memory.MemoryRef{}
+	}
+
+	s.logger.Info("memory_session_restore", "session_id", in.SessionID, "buffer_len", len(buf), "closed", sess.ClosedAt != nil)
+	return nil, SessionRestoreOutput{
+		Buffer:      buf,
+		ProjectHint: sess.ProjectHint,
+		Tags:        normalizeTagsSlice(sess.Tags),
+		UpdatedAt:   formatSessionTime(sess.UpdatedAt),
+		ClosedAt:    formatSessionTimePtr(sess.ClosedAt),
+	}, nil
+}
+
+// --- memory_session_end ---
+
+// SessionEndInput is the input schema for memory_session_end.
+type SessionEndInput struct {
+	SessionID string          `json:"session_id" jsonschema:"session to close"`
+	Episode   *EpisodePayload `json:"episode,omitempty" jsonschema:"if set, write an L3 episode summarizing the session"`
+	// EpisodeType lets the caller choose the subtype for the summary episode.
+	// Defaults to "feedback" when unset — the best default for retrospective
+	// "here's what we learned" tuples. Facts-only taxonomy values are rejected
+	// downstream by writeEpisode's handleWrite wrapper.
+	EpisodeType string   `json:"episode_type,omitempty" jsonschema:"subtype for the optional summary episode (default: feedback)"`
+	EpisodeTags []string `json:"episode_tags,omitempty" jsonschema:"extra tags to apply to the summary episode; session:<id> is always added"`
+}
+
+// SessionEndOutput is the output schema for memory_session_end.
+type SessionEndOutput struct {
+	SessionID      string `json:"session_id"`
+	EpisodeID      string `json:"episode_id,omitempty"`
+	ClustersTicked int    `json:"clusters_ticked"`
+}
+
+func (s *Server) handleSessionEnd(ctx context.Context, _ *mcpsdk.CallToolRequest, in SessionEndInput) (*mcpsdk.CallToolResult, SessionEndOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, SessionEndOutput{}, nil
+	}
+
+	if in.SessionID == "" {
+		return nil, SessionEndOutput{}, fmt.Errorf("session_id is required")
+	}
+
+	sess, err := s.store.GetSession(ctx, in.SessionID)
+	if err != nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("get session: %w", err)
+	}
+	if sess == nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("session not found: %s", in.SessionID)
+	}
+	if sess.ClosedAt != nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("session already closed: %s", in.SessionID)
+	}
+
+	// Step 1: resolve cluster IDs from the buffer's live fact/episode refs.
+	// Missing memories (deleted since they landed in the buffer) are skipped
+	// silently — they carry no live cluster membership to tick.
+	clusterSet := make(map[string]struct{})
+	bufferFactIDs := make([]string, 0, len(sess.WorkingMem.Buffer))
+	for _, ref := range sess.WorkingMem.Buffer {
+		switch ref.Layer {
+		case memory.TypeL2Semantic:
+			fact, err := s.store.GetFact(ctx, ref.ID)
+			if err != nil {
+				return nil, SessionEndOutput{}, fmt.Errorf("get fact %s: %w", ref.ID, err)
+			}
+			if fact == nil {
+				continue // deleted; skip
+			}
+			if fact.ClusterID != "" {
+				clusterSet[fact.ClusterID] = struct{}{}
+			}
+			bufferFactIDs = append(bufferFactIDs, fact.ID)
+		case memory.TypeL3Episodic:
+			ep, err := s.store.GetEpisode(ctx, ref.ID)
+			if err != nil {
+				return nil, SessionEndOutput{}, fmt.Errorf("get episode %s: %w", ref.ID, err)
+			}
+			if ep == nil {
+				continue // deleted; skip
+			}
+			if ep.ClusterID != "" {
+				clusterSet[ep.ClusterID] = struct{}{}
+			}
+		default:
+			// Unknown layer — shouldn't happen for a buffer entry, skip.
+			continue
+		}
+	}
+
+	clusterIDs := make([]string, 0, len(clusterSet))
+	for cid := range clusterSet {
+		clusterIDs = append(clusterIDs, cid)
+	}
+	// Sort for determinism (useful for logs and tests).
+	sort.Strings(clusterIDs)
+
+	// Step 2: scoped decay tick — bump all, reset the touched set to 0.
+	if err := s.mgr.TickDecay(ctx, clusterIDs); err != nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("tick decay: %w", err)
+	}
+
+	out := SessionEndOutput{
+		SessionID:      in.SessionID,
+		ClustersTicked: len(clusterIDs),
+	}
+
+	// Step 3: optional summary episode. We delegate to handleWrite so
+	// embedding, clustering, tick-decay, and validation are shared with the
+	// normal write path. Passing SessionID="" is deliberate: we're closing
+	// the session on the next step and don't want another buffer mutation
+	// against it.
+	if in.Episode != nil {
+		ep := *in.Episode // shallow copy so we can safely mutate
+
+		// Auto-link: ensure every L2 fact currently in the buffer is linked
+		// from this summary episode. Dedup against any fact IDs the caller
+		// explicitly supplied.
+		existingLinks := make(map[string]struct{}, len(ep.LinkedFactIDs))
+		for _, fid := range ep.LinkedFactIDs {
+			existingLinks[fid] = struct{}{}
+		}
+		for _, fid := range bufferFactIDs {
+			if _, ok := existingLinks[fid]; !ok {
+				ep.LinkedFactIDs = append(ep.LinkedFactIDs, fid)
+				existingLinks[fid] = struct{}{}
+			}
+		}
+
+		// Auto-tag: always attach "session:<id>" so the episode is
+		// cross-session discoverable. The rest of the tags come from
+		// EpisodeTags verbatim (normalization happens downstream).
+		sessionTag := "session:" + in.SessionID
+		epTags := make([]string, 0, len(in.EpisodeTags)+1)
+		epTags = append(epTags, in.EpisodeTags...)
+		hasSessionTag := false
+		for _, t := range in.EpisodeTags {
+			if strings.EqualFold(strings.TrimSpace(t), sessionTag) {
+				hasSessionTag = true
+				break
+			}
+		}
+		if !hasSessionTag {
+			epTags = append(epTags, sessionTag)
+		}
+
+		subtype := in.EpisodeType
+		if subtype == "" {
+			subtype = "feedback"
+		}
+
+		_, writeOut, err := s.handleWrite(ctx, nil, WriteInput{
+			Type:    subtype,
+			Episode: &ep,
+			Tags:    epTags,
+			// SessionID intentionally left empty: we are closing this session
+			// after the write and must not re-enter applySessionMutation
+			// against it.
+		})
+		if err != nil {
+			return nil, SessionEndOutput{}, fmt.Errorf("write session episode: %w", err)
+		}
+		out.EpisodeID = writeOut.ID
+	}
+
+	// Step 4: close the session.
+	if err := s.store.CloseSession(ctx, in.SessionID); err != nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("close session: %w", err)
+	}
+
+	s.logger.Info("memory_session_end",
+		"session_id", in.SessionID,
+		"clusters_ticked", out.ClustersTicked,
+		"episode_written", out.EpisodeID != "",
+	)
+	return nil, out, nil
+}

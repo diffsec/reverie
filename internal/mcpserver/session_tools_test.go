@@ -391,3 +391,475 @@ func TestRecall_BudgetRespected(t *testing.T) {
 // contract is asserted by applySessionMutation's comment + the behavior
 // that the parent op's return value is unaffected by a snapshot failure.
 // If this becomes load-bearing a later phase can add the hook and cover it.
+
+// --- Phase 6c: session_init / snapshot / restore / end ---
+
+// newFreshSessionTestServer builds a bare server (no pre-seeded session) so
+// session_init tests can exercise the create path. Mirrors newSessionTestServer
+// with the CreateSession call elided.
+func newFreshSessionTestServer(t *testing.T, embedder *stubEmbedder, budgetMax int) *Server {
+	t.Helper()
+	cfg := config.Defaults()
+	if budgetMax > 0 {
+		cfg.Session.BufferBudgetMax = budgetMax
+	}
+	store := memory.NewMemStore()
+	dec := decay.NewDecayer(10.0, 0.3)
+	mgr := manager.NewMemoryManager(store, dec, 0.10, 0.05)
+	assigner := cluster.NewAssigner(store, 0.60, 0.5, 0.5)
+	s := NewServer(store, embedder, dec, mgr, assigner, cfg, nil)
+	t.Cleanup(s.recallCache.stop)
+	return s
+}
+
+func TestSessionInit_NewSession(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newFreshSessionTestServer(t, emb, 0)
+
+	_, out, err := s.handleSessionInit(context.Background(), nil, SessionInitInput{
+		SessionID:   "sess-new",
+		ProjectHint: "reverie",
+		Tags:        []string{"Phase6", "session"},
+	})
+	if err != nil {
+		t.Fatalf("session_init: %v", err)
+	}
+	if !out.Created {
+		t.Errorf("Created = false, want true")
+	}
+	if out.SessionID != "sess-new" {
+		t.Errorf("SessionID = %q, want sess-new", out.SessionID)
+	}
+	if len(out.Buffer) != 0 {
+		t.Errorf("Buffer len = %d, want 0", len(out.Buffer))
+	}
+	if out.CreatedAt == "" {
+		t.Errorf("CreatedAt should be populated")
+	}
+	if out.ClosedAt != nil {
+		t.Errorf("ClosedAt should be nil on fresh create, got %q", *out.ClosedAt)
+	}
+	// Tags should be normalized (lowercase, sorted).
+	if len(out.Tags) != 2 || out.Tags[0] != "phase6" || out.Tags[1] != "session" {
+		t.Errorf("Tags = %v, want [phase6 session]", out.Tags)
+	}
+	if out.ProjectHint != "reverie" {
+		t.Errorf("ProjectHint = %q, want reverie", out.ProjectHint)
+	}
+
+	// Sanity: row exists in the store.
+	sess := getSession(t, s, "sess-new")
+	if sess == nil {
+		t.Fatal("session row missing from store")
+	}
+}
+
+func TestSessionInit_EmptyID(t *testing.T) {
+	s := newFreshSessionTestServer(t, newStubEmbedder(4), 0)
+	_, _, err := s.handleSessionInit(context.Background(), nil, SessionInitInput{SessionID: ""})
+	if err == nil {
+		t.Fatal("expected error for empty session_id")
+	}
+}
+
+func TestSessionInit_ResumeExisting(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["brand new"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s, sessID := newSessionTestServer(t, emb, 0)
+
+	// Seed a buffer via a session-scoped write so resume has something to return.
+	ctx := context.Background()
+	_, writeOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "brand new", Type: "user", SessionID: sessID,
+	})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	_, out, err := s.handleSessionInit(ctx, nil, SessionInitInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_init resume: %v", err)
+	}
+	if out.Created {
+		t.Errorf("Created = true, want false on resume")
+	}
+	if len(out.Buffer) != 1 {
+		t.Fatalf("Buffer len = %d, want 1", len(out.Buffer))
+	}
+	if out.Buffer[0].ID != writeOut.ID {
+		t.Errorf("Buffer[0].ID = %q, want %q", out.Buffer[0].ID, writeOut.ID)
+	}
+	if out.ClosedAt != nil {
+		t.Errorf("ClosedAt should be nil on active resume")
+	}
+}
+
+func TestSessionInit_ResumeClosedSession_Errors(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	if err := s.store.CloseSession(context.Background(), sessID); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+
+	_, _, err := s.handleSessionInit(context.Background(), nil, SessionInitInput{SessionID: sessID})
+	if err == nil {
+		t.Fatal("expected error resuming closed session")
+	}
+	if !strings.Contains(err.Error(), "session closed") {
+		t.Errorf("error should mention session closed: %v", err)
+	}
+}
+
+func TestSessionInit_ResumeReplacesProjectHint(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	// Seed initial meta.
+	if err := s.store.UpdateSessionMeta(context.Background(), sessID, "original", []string{"keep"}); err != nil {
+		t.Fatalf("seed meta: %v", err)
+	}
+
+	_, out, err := s.handleSessionInit(context.Background(), nil, SessionInitInput{
+		SessionID:   sessID,
+		ProjectHint: "replaced",
+	})
+	if err != nil {
+		t.Fatalf("session_init: %v", err)
+	}
+	if out.ProjectHint != "replaced" {
+		t.Errorf("ProjectHint = %q, want 'replaced'", out.ProjectHint)
+	}
+	// Tags should be untouched because in.Tags is nil.
+	if len(out.Tags) != 1 || out.Tags[0] != "keep" {
+		t.Errorf("Tags = %v, want [keep]", out.Tags)
+	}
+}
+
+func TestSessionInit_ResumeMergesTags(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	if err := s.store.UpdateSessionMeta(context.Background(), sessID, "", []string{"one", "two"}); err != nil {
+		t.Fatalf("seed meta: %v", err)
+	}
+
+	_, out, err := s.handleSessionInit(context.Background(), nil, SessionInitInput{
+		SessionID: sessID,
+		// Include a duplicate "One" (different case) + a new tag. Merge
+		// should dedup case-insensitively via the store normalizer and add "three".
+		Tags: []string{"One", "three"},
+	})
+	if err != nil {
+		t.Fatalf("session_init: %v", err)
+	}
+
+	// Expect union {one,two,three} — normalized order is alphabetical.
+	want := []string{"one", "three", "two"}
+	if len(out.Tags) != len(want) {
+		t.Fatalf("Tags len = %d, want %d (got %v)", len(out.Tags), len(want), out.Tags)
+	}
+	for i, w := range want {
+		if out.Tags[i] != w {
+			t.Errorf("Tags[%d] = %q, want %q", i, out.Tags[i], w)
+		}
+	}
+}
+
+func TestSessionSnapshot_Active(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+
+	_, out, err := s.handleSessionSnapshot(context.Background(), nil, SessionSnapshotInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_snapshot: %v", err)
+	}
+	if !out.Persisted {
+		t.Errorf("Persisted = false, want true")
+	}
+	if out.UpdatedAt == "" {
+		t.Errorf("UpdatedAt should be populated")
+	}
+}
+
+func TestSessionSnapshot_UnknownSession_Errors(t *testing.T) {
+	s := newFreshSessionTestServer(t, newStubEmbedder(4), 0)
+	_, _, err := s.handleSessionSnapshot(context.Background(), nil, SessionSnapshotInput{SessionID: "nope"})
+	if err == nil {
+		t.Fatal("expected error for unknown session")
+	}
+	if !strings.Contains(err.Error(), "session not found") {
+		t.Errorf("error should mention 'session not found': %v", err)
+	}
+}
+
+func TestSessionSnapshot_ClosedSession_Errors(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	if err := s.store.CloseSession(context.Background(), sessID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_, _, err := s.handleSessionSnapshot(context.Background(), nil, SessionSnapshotInput{SessionID: sessID})
+	if err == nil {
+		t.Fatal("expected error for closed session")
+	}
+	if !strings.Contains(err.Error(), "session closed") {
+		t.Errorf("error should mention 'session closed': %v", err)
+	}
+}
+
+func TestSessionRestore_ShapeIncludesClosedAt(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	if err := s.store.UpdateSessionMeta(context.Background(), sessID, "proj", []string{"alpha"}); err != nil {
+		t.Fatalf("seed meta: %v", err)
+	}
+	if err := s.store.CloseSession(context.Background(), sessID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, out, err := s.handleSessionRestore(context.Background(), nil, SessionRestoreInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_restore: %v", err)
+	}
+	if out.ClosedAt == nil {
+		t.Fatal("ClosedAt should be set for closed session")
+	}
+	if out.UpdatedAt == "" {
+		t.Errorf("UpdatedAt should be populated")
+	}
+	if out.ProjectHint != "proj" {
+		t.Errorf("ProjectHint = %q, want proj", out.ProjectHint)
+	}
+	if len(out.Tags) != 1 || out.Tags[0] != "alpha" {
+		t.Errorf("Tags = %v, want [alpha]", out.Tags)
+	}
+}
+
+func TestSessionRestore_UnknownSession_Errors(t *testing.T) {
+	s := newFreshSessionTestServer(t, newStubEmbedder(4), 0)
+	_, _, err := s.handleSessionRestore(context.Background(), nil, SessionRestoreInput{SessionID: "nope"})
+	if err == nil {
+		t.Fatal("expected error for unknown session")
+	}
+	if !strings.Contains(err.Error(), "session not found") {
+		t.Errorf("error should mention 'session not found': %v", err)
+	}
+}
+
+// TestSessionEnd_TickScopedToBufferClusters seeds a session with buffer
+// entries pointing to TWO distinct clusters, verifies session_end ticks
+// exactly those two (resetting turns_since) and bumps an untouched cluster.
+func TestSessionEnd_TickScopedToBufferClusters(t *testing.T) {
+	emb := newStubEmbedder(4)
+	// Three orthogonal seeds so each lands in its own cluster (threshold=0.60
+	// inside the assigner). Subtype distinct so no supersede.
+	emb.vectors["seed-a"] = []float32{1, 0, 0, 0}
+	emb.vectors["seed-b"] = []float32{0, 1, 0, 0}
+	emb.vectors["seed-c"] = []float32{0, 0, 1, 0}
+	s, sessID := newSessionTestServer(t, emb, 0)
+
+	ctx := context.Background()
+	_, wa, err := s.handleWrite(ctx, nil, WriteInput{Content: "seed-a", Type: "user"})
+	if err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	_, wb, err := s.handleWrite(ctx, nil, WriteInput{Content: "seed-b", Type: "project"})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	// seed-c is NOT added to the session buffer; its cluster should bump.
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{Content: "seed-c", Type: "reference"})
+	if err != nil {
+		t.Fatalf("write c: %v", err)
+	}
+
+	factA, err := s.store.GetFact(ctx, wa.ID)
+	if err != nil || factA == nil {
+		t.Fatalf("getFact a: %v", err)
+	}
+	factB, err := s.store.GetFact(ctx, wb.ID)
+	if err != nil || factB == nil {
+		t.Fatalf("getFact b: %v", err)
+	}
+	if factA.ClusterID == factB.ClusterID {
+		t.Fatalf("seeds share a cluster (%s); test needs two distinct clusters", factA.ClusterID)
+	}
+
+	// Inject the buffer directly — fastest path to "two buffer entries, two
+	// clusters" without replaying multiple recalls.
+	if err := s.store.UpdateSessionBuffer(ctx, sessID, memory.WorkingMemory{
+		Buffer: []memory.MemoryRef{
+			{ID: wa.ID, Layer: memory.TypeL2Semantic, Score: 0.9, Content: "seed-a"},
+			{ID: wb.ID, Layer: memory.TypeL2Semantic, Score: 0.8, Content: "seed-b"},
+		},
+		BudgetUsed: 2,
+		BudgetMax:  50,
+	}); err != nil {
+		t.Fatalf("inject buffer: %v", err)
+	}
+
+	// Snapshot pre-tick turns_since for each cluster. After the writes above
+	// each cluster was touched by TickDecay([clusterID]) — turns_since values
+	// are cluster-specific, so we just record what's there and verify
+	// direction-of-change post-session_end.
+	preClusters, err := s.store.ListClusters(ctx)
+	if err != nil {
+		t.Fatalf("list clusters pre: %v", err)
+	}
+	preTurns := map[string]int{}
+	for _, c := range preClusters {
+		preTurns[c.ID] = c.TurnsSince
+	}
+
+	_, endOut, err := s.handleSessionEnd(ctx, nil, SessionEndInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_end: %v", err)
+	}
+	if endOut.ClustersTicked != 2 {
+		t.Errorf("ClustersTicked = %d, want 2", endOut.ClustersTicked)
+	}
+
+	postClusters, err := s.store.ListClusters(ctx)
+	if err != nil {
+		t.Fatalf("list clusters post: %v", err)
+	}
+	touched := map[string]bool{factA.ClusterID: true, factB.ClusterID: true}
+	for _, c := range postClusters {
+		if touched[c.ID] {
+			if c.TurnsSince != 0 {
+				t.Errorf("touched cluster %s turns_since = %d, want 0", c.ID, c.TurnsSince)
+			}
+		} else {
+			if c.TurnsSince != preTurns[c.ID]+1 {
+				t.Errorf("untouched cluster %s turns_since = %d, want %d (pre=%d)", c.ID, c.TurnsSince, preTurns[c.ID]+1, preTurns[c.ID])
+			}
+		}
+	}
+
+	// Session must be closed.
+	sess := getSession(t, s, sessID)
+	if sess.ClosedAt == nil {
+		t.Error("session ClosedAt should be set after session_end")
+	}
+}
+
+func TestSessionEnd_WithEpisodePayload(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["buffered"] = []float32{1, 0, 0, 0}
+	emb.vectors["s\na\no\np"] = []float32{0, 1, 0, 0}
+	s, sessID := newSessionTestServer(t, emb, 0)
+
+	ctx := context.Background()
+	_, writeOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "buffered", Type: "project", SessionID: sessID,
+	})
+	if err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	_, endOut, err := s.handleSessionEnd(ctx, nil, SessionEndInput{
+		SessionID: sessID,
+		Episode: &EpisodePayload{
+			Situation: "s", Action: "a", Outcome: "o", Preemptive: "p",
+		},
+	})
+	if err != nil {
+		t.Fatalf("session_end: %v", err)
+	}
+	if endOut.EpisodeID == "" {
+		t.Fatal("EpisodeID should be populated")
+	}
+
+	// Verify the episode was written with the session tag and auto-link.
+	ep, err := s.store.GetEpisode(ctx, endOut.EpisodeID)
+	if err != nil || ep == nil {
+		t.Fatalf("GetEpisode: %v", err)
+	}
+	expectTag := "session:" + sessID
+	hasSessionTag := false
+	for _, tag := range ep.Tags {
+		if tag == expectTag {
+			hasSessionTag = true
+			break
+		}
+	}
+	if !hasSessionTag {
+		t.Errorf("episode tags %v should include %q", ep.Tags, expectTag)
+	}
+
+	// Auto-link: the buffered fact should be linked to the episode.
+	factLinks, err := s.store.GetEpisodeLinks(ctx, ep.ID)
+	if err != nil {
+		t.Fatalf("GetEpisodeLinks: %v", err)
+	}
+	foundLink := false
+	for _, l := range factLinks {
+		if l.FactID == writeOut.ID {
+			foundLink = true
+			break
+		}
+	}
+	if !foundLink {
+		t.Errorf("episode should be linked to buffered fact %s; got %+v", writeOut.ID, factLinks)
+	}
+}
+
+func TestSessionEnd_WithoutEpisode(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+
+	_, endOut, err := s.handleSessionEnd(context.Background(), nil, SessionEndInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_end: %v", err)
+	}
+	if endOut.EpisodeID != "" {
+		t.Errorf("EpisodeID = %q, want empty string", endOut.EpisodeID)
+	}
+	// Session must still close.
+	sess := getSession(t, s, sessID)
+	if sess.ClosedAt == nil {
+		t.Error("session should be closed even without an episode")
+	}
+}
+
+func TestSessionEnd_AlreadyClosed_Errors(t *testing.T) {
+	s, sessID := newSessionTestServer(t, newStubEmbedder(4), 0)
+	if err := s.store.CloseSession(context.Background(), sessID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_, _, err := s.handleSessionEnd(context.Background(), nil, SessionEndInput{SessionID: sessID})
+	if err == nil {
+		t.Fatal("expected error for already-closed session")
+	}
+	if !strings.Contains(err.Error(), "already closed") {
+		t.Errorf("error should mention 'already closed': %v", err)
+	}
+}
+
+// TestSessionEnd_SkipsDeletedMemoryIDs injects a buffer with one live fact
+// and one dangling reference to a deleted fact. session_end must gracefully
+// skip the dead ref — ClustersTicked counts only the live membership.
+func TestSessionEnd_SkipsDeletedMemoryIDs(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["live"] = []float32{1, 0, 0, 0}
+	s, sessID := newSessionTestServer(t, emb, 0)
+
+	ctx := context.Background()
+	_, liveOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "live", Type: "user"})
+	if err != nil {
+		t.Fatalf("write live: %v", err)
+	}
+
+	// Inject a buffer referencing a non-existent ID alongside the live one.
+	if err := s.store.UpdateSessionBuffer(ctx, sessID, memory.WorkingMemory{
+		Buffer: []memory.MemoryRef{
+			{ID: liveOut.ID, Layer: memory.TypeL2Semantic, Score: 0.9, Content: "live"},
+			{ID: "deleted-fact-id", Layer: memory.TypeL2Semantic, Score: 0.5, Content: "ghost"},
+			{ID: "deleted-episode-id", Layer: memory.TypeL3Episodic, Score: 0.5, Content: "ghost ep"},
+		},
+		BudgetUsed: 3,
+		BudgetMax:  50,
+	}); err != nil {
+		t.Fatalf("inject buffer: %v", err)
+	}
+
+	_, endOut, err := s.handleSessionEnd(ctx, nil, SessionEndInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_end: %v", err)
+	}
+	// Only the live fact's cluster should be counted.
+	if endOut.ClustersTicked != 1 {
+		t.Errorf("ClustersTicked = %d, want 1 (dead refs skipped)", endOut.ClustersTicked)
+	}
+}
