@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -43,6 +44,13 @@ func (s *Server) registerResources(srv *mcpsdk.Server) {
 		Description: "Per-cluster detail view — cluster metadata plus a paginated list of members (facts and episodes). Members are ordered by created_at ascending. Query params: limit (default 50, max 200), offset (default 0).",
 		MIMEType:    "application/json",
 	}, s.handleL1ClusterDetailResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "reverie://stats/daily{?from,to}",
+		Name:        "Daily Activity Stats",
+		Description: "Per-day counters for facts in/out, episodes in/out, and supersedes, maintained by DB triggers. Dates are UTC YYYY-MM-DD. Defaults: from = today-30 days, to = today. Gaps are zero-filled. Max span 365 days.",
+		MIMEType:    "application/json",
+	}, s.handleStatsDailyResource)
 }
 
 // --- reverie://status ---
@@ -422,6 +430,134 @@ func (s *Server) handleL3RecentResource(ctx context.Context, req *mcpsdk.ReadRes
 		return nil, fmt.Errorf("l3 recent: marshal: %w", err)
 	}
 
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(data),
+		}},
+	}, nil
+}
+
+// --- reverie://stats/daily ---
+
+const (
+	// statsDailyDefaultLookback is the default [from, to] span when the
+	// caller omits `from`: 30 days prior to `to` (inclusive on both ends).
+	statsDailyDefaultLookback = 30
+	// statsDailyMaxSpanDays caps the inclusive span to one year. The table
+	// is tiny but a huge range explodes the zero-fill output for no benefit.
+	statsDailyMaxSpanDays = 365
+	// statsDailyDateFormat is the canonical YYYY-MM-DD representation used
+	// for both the daily_stats PK and our API contract. UTC always.
+	statsDailyDateFormat = "2006-01-02"
+)
+
+// dailyStatsResponse is the JSON structure for the stats/daily resource.
+// Days is sorted oldest first and is dense — gaps in the daily_stats table
+// are emitted as zero-value rows so clients can graph without interpolating.
+type dailyStatsResponse struct {
+	From string            `json:"from"`
+	To   string            `json:"to"`
+	Days []dailyStatsEntry `json:"days"`
+}
+
+type dailyStatsEntry struct {
+	Date        string `json:"date"`
+	FactsIn     int    `json:"facts_in"`
+	FactsOut    int    `json:"facts_out"`
+	EpisodesIn  int    `json:"episodes_in"`
+	EpisodesOut int    `json:"episodes_out"`
+	Supersedes  int    `json:"supersedes"`
+}
+
+// parseStatsDailyURI extracts `from` and `to` from reverie://stats/daily?from=..&to=..
+// Defaults: `to` = today (UTC), `from` = to - 30 days. Values must parse as
+// YYYY-MM-DD. Validates `from <= to` and span <= 365 days (inclusive).
+func parseStatsDailyURI(raw string, now time.Time) (from, to string, err error) {
+	u, perr := url.Parse(raw)
+	if perr != nil {
+		return "", "", fmt.Errorf("invalid uri: %w", perr)
+	}
+
+	today := now.UTC().Format(statsDailyDateFormat)
+	q := u.Query()
+
+	to = q.Get("to")
+	if to == "" {
+		to = today
+	}
+	toT, err := time.Parse(statsDailyDateFormat, to)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid to: %q (want YYYY-MM-DD)", to)
+	}
+
+	from = q.Get("from")
+	if from == "" {
+		from = toT.AddDate(0, 0, -statsDailyDefaultLookback).Format(statsDailyDateFormat)
+	}
+	fromT, err := time.Parse(statsDailyDateFormat, from)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid from: %q (want YYYY-MM-DD)", from)
+	}
+
+	if fromT.After(toT) {
+		return "", "", fmt.Errorf("from (%s) must be <= to (%s)", from, to)
+	}
+	// Inclusive span in days: to - from + 1. The cap is a guardrail on
+	// zero-fill output size; the SQL itself would handle larger ranges fine.
+	spanDays := int(toT.Sub(fromT).Hours()/24) + 1
+	if spanDays > statsDailyMaxSpanDays {
+		return "", "", fmt.Errorf("span %d days exceeds max %d", spanDays, statsDailyMaxSpanDays)
+	}
+
+	return from, to, nil
+}
+
+func (s *Server) handleStatsDailyResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	from, to, err := parseStatsDailyURI(req.Params.URI, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("stats daily: %w", err)
+	}
+
+	rows, err := s.store.ListDailyStats(ctx, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("stats daily: list: %w", err)
+	}
+
+	// Index rows by date for O(1) lookup while expanding the window. The
+	// daily_stats table is tiny (one row per day of server activity), so the
+	// map is cheap and the expanded output stays dense.
+	byDate := make(map[string]memory.DailyStats, len(rows))
+	for _, r := range rows {
+		byDate[r.Date] = r
+	}
+
+	fromT, _ := time.Parse(statsDailyDateFormat, from)
+	toT, _ := time.Parse(statsDailyDateFormat, to)
+
+	days := []dailyStatsEntry{}
+	for d := fromT; !d.After(toT); d = d.AddDate(0, 0, 1) {
+		key := d.Format(statsDailyDateFormat)
+		if r, ok := byDate[key]; ok {
+			days = append(days, dailyStatsEntry{
+				Date:        r.Date,
+				FactsIn:     r.FactsIn,
+				FactsOut:    r.FactsOut,
+				EpisodesIn:  r.EpisodesIn,
+				EpisodesOut: r.EpisodesOut,
+				Supersedes:  r.Supersedes,
+			})
+			continue
+		}
+		days = append(days, dailyStatsEntry{Date: key})
+	}
+
+	resp := dailyStatsResponse{From: from, To: to, Days: days}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("stats daily: marshal: %w", err)
+	}
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{
 			URI:      req.Params.URI,

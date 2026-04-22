@@ -265,6 +265,226 @@ func TestMigrationsMonotonic(t *testing.T) {
 	}
 }
 
+// TestMigration3_FreshDB covers the tables + seed row + trigger set created
+// by migration 3 when run on an empty database. Checks structural presence
+// rather than any specific trigger body.
+func TestMigration3_FreshDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mig3_fresh.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// daily_stats exists (empty since no facts/episodes yet).
+	if countRows(t, db, "daily_stats") != 0 {
+		t.Errorf("daily_stats should be empty on fresh DB")
+	}
+
+	// decay_state has exactly one row, id=1, last_tick NULL.
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM decay_state`).Scan(&rows); err != nil {
+		t.Fatalf("count decay_state: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("decay_state row count = %d, want 1", rows)
+	}
+	var id int
+	var lastTick sql.NullString
+	if err := db.QueryRow(`SELECT id, last_tick FROM decay_state WHERE id = 1`).Scan(&id, &lastTick); err != nil {
+		t.Fatalf("select decay_state: %v", err)
+	}
+	if id != 1 {
+		t.Errorf("decay_state id = %d, want 1", id)
+	}
+	if lastTick.Valid {
+		t.Errorf("decay_state.last_tick should be NULL on fresh DB, got %q", lastTick.String)
+	}
+
+	// All six triggers are present in sqlite_master.
+	wantTriggers := []string{
+		"trg_facts_insert",
+		"trg_facts_delete",
+		"trg_facts_supersede",
+		"trg_episodes_insert",
+		"trg_episodes_delete",
+	}
+	for _, name := range wantTriggers {
+		var found string
+		err := db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='trigger' AND name=?`,
+			name,
+		).Scan(&found)
+		if err != nil {
+			t.Errorf("trigger %q missing: %v", name, err)
+		}
+	}
+}
+
+// TestMigration3_Backfill exercises the one-shot backfill path by applying
+// the embedded migrations against a DB that already has facts + episodes
+// sitting at known creation dates. Verifies that daily_stats receives the
+// aggregated counts and that a date shared between facts and episodes ends
+// up with both counters set (the ON CONFLICT case the comment warns about).
+func TestMigration3_Backfill(t *testing.T) {
+	// Apply migrations 1 and 2 manually, seed data, then append migration 3
+	// and re-run applyMigrations. Using the raw driver bypasses Open's
+	// PRAGMA setup; that's fine for a test focused on migration body semantics.
+	saved := migrations
+	t.Cleanup(func() { migrations = saved })
+
+	// Snip migration 3 from the embedded list so we can control when it runs.
+	var mig3 migration
+	trimmed := make([]migration, 0, len(saved))
+	for _, m := range saved {
+		if m.Version == 3 {
+			mig3 = m
+			continue
+		}
+		trimmed = append(trimmed, m)
+	}
+	migrations = trimmed
+
+	path := filepath.Join(t.TempDir(), "mig3_backfill.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatalf("pragma fk: %v", err)
+	}
+
+	if err := applyMigrations(raw); err != nil {
+		t.Fatalf("applyMigrations (up to 2): %v", err)
+	}
+
+	// Seed default cluster (FK target) and facts/episodes with explicit
+	// created_at strings so the backfill grouping is deterministic.
+	if _, err := raw.Exec(
+		`INSERT INTO clusters (id, summary) VALUES ('default', 'default')`,
+	); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+
+	const dayA = "2026-04-10"
+	const dayB = "2026-04-11"
+	// Two facts on dayA, one fact on dayB.
+	factSeed := []struct{ id, created string }{
+		{"f1", dayA + "T00:00:01Z"},
+		{"f2", dayA + "T10:00:00Z"},
+		{"f3", dayB + "T00:00:01Z"},
+	}
+	for _, f := range factSeed {
+		if _, err := raw.Exec(
+			`INSERT INTO facts (id, cluster_id, content, content_hash, created_at, accessed_at)
+			 VALUES (?, 'default', ?, ?, ?, ?)`,
+			f.id, f.id+" content", f.id+"-hash", f.created, f.created,
+		); err != nil {
+			t.Fatalf("seed fact %s: %v", f.id, err)
+		}
+	}
+
+	// One episode on dayA (shared date with facts), one on dayB.
+	epSeed := []struct{ id, created string }{
+		{"e1", dayA + "T12:00:00Z"},
+		{"e2", dayB + "T12:00:00Z"},
+	}
+	for _, e := range epSeed {
+		if _, err := raw.Exec(
+			`INSERT INTO episodes (id, cluster_id, situation, action, outcome, preemptive, content_hash, created_at, accessed_at)
+			 VALUES (?, 'default', 'sit', 'act', 'out', 'pre', ?, ?, ?)`,
+			e.id, e.id+"-hash", e.created, e.created,
+		); err != nil {
+			t.Fatalf("seed episode %s: %v", e.id, err)
+		}
+	}
+
+	// Now plug migration 3 back in and apply it.
+	migrations = append(trimmed, mig3)
+	if err := applyMigrations(raw); err != nil {
+		t.Fatalf("applyMigrations (mig 3): %v", err)
+	}
+
+	// Expect: dayA has facts_in=2, episodes_in=1; dayB has facts_in=1, episodes_in=1.
+	rowsByDate := map[string]struct{ factsIn, epIn int }{}
+	rows, err := raw.Query(`SELECT date, facts_in, episodes_in FROM daily_stats ORDER BY date`)
+	if err != nil {
+		t.Fatalf("query daily_stats: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		var fin, epin int
+		if err := rows.Scan(&d, &fin, &epin); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		rowsByDate[d] = struct{ factsIn, epIn int }{fin, epin}
+	}
+
+	gotA, okA := rowsByDate[dayA]
+	if !okA {
+		t.Fatalf("missing row for %s; got %+v", dayA, rowsByDate)
+	}
+	if gotA.factsIn != 2 || gotA.epIn != 1 {
+		t.Errorf("%s: facts_in=%d episodes_in=%d, want 2/1", dayA, gotA.factsIn, gotA.epIn)
+	}
+	gotB, okB := rowsByDate[dayB]
+	if !okB {
+		t.Fatalf("missing row for %s; got %+v", dayB, rowsByDate)
+	}
+	if gotB.factsIn != 1 || gotB.epIn != 1 {
+		t.Errorf("%s: facts_in=%d episodes_in=%d, want 1/1", dayB, gotB.factsIn, gotB.epIn)
+	}
+}
+
+// TestMigration3_Idempotent verifies that re-running applyMigrations on a
+// fully-migrated DB doesn't re-run migration 3's backfill. The
+// schema_migrations bookkeeping row for version 3 gates the rerun; the test
+// checks the gate holds by writing a counter via raw SQL and confirming it
+// isn't clobbered.
+func TestMigration3_Idempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mig3_idem.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	// Write a known daily_stats row via raw SQL — simulating a day with
+	// counts that didn't come from triggers.
+	const probeDate = "2026-04-15"
+	if _, err := db.Exec(
+		`INSERT INTO daily_stats (date, facts_in, episodes_in) VALUES (?, 7, 11)`,
+		probeDate,
+	); err != nil {
+		t.Fatalf("seed probe row: %v", err)
+	}
+	db.Close()
+
+	// Reopen: applyMigrations should see version 3 already applied and skip
+	// the backfill entirely (no INSERT OR IGNORE collision recomputation).
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer db2.Close()
+
+	// Version still 3 (not advanced past it; not repeated).
+	got := appliedVersions(t, db2)
+	if got[len(got)-1] != 3 {
+		t.Errorf("highest applied version = %d, want 3", got[len(got)-1])
+	}
+	// Probe row unchanged.
+	var factsIn, epIn int
+	if err := db2.QueryRow(
+		`SELECT facts_in, episodes_in FROM daily_stats WHERE date = ?`, probeDate,
+	).Scan(&factsIn, &epIn); err != nil {
+		t.Fatalf("probe reselect: %v", err)
+	}
+	if factsIn != 7 || epIn != 11 {
+		t.Errorf("probe row changed: facts_in=%d episodes_in=%d, want 7/11", factsIn, epIn)
+	}
+}
+
 // Smoke check that the migration 2 payload is exactly the two ALTERs the
 // spec calls for. Using contains rather than equality so formatting is
 // flexible; the pair of ALTER TABLEs is the intent.

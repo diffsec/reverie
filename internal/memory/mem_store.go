@@ -1010,6 +1010,15 @@ func (m *memStore) FindSimilarFacts(_ context.Context, subtype string, queryVec 
 	return candidates, nil
 }
 
+// ListDailyStats on the in-memory store always returns an empty slice.
+// The daily_stats table in the SQLite store is populated by SQL triggers on
+// facts/episodes; memStore has no equivalent trigger machinery, and no test
+// that uses memStore needs historical activity telemetry. This method exists
+// solely to satisfy the Store interface.
+func (m *memStore) ListDailyStats(_ context.Context, _, _ string) ([]DailyStats, error) {
+	return []DailyStats{}, nil
+}
+
 func (m *memStore) Close() error {
 	return nil
 }

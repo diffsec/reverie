@@ -475,3 +475,144 @@ func TestL1ClusterDetail_InvalidLimitOffset(t *testing.T) {
 		t.Error("negative offset should error")
 	}
 }
+
+// --- reverie://stats/daily tests (Phase 5C) ---
+
+// readStatsDaily issues a ReadResource against the stats/daily handler and
+// parses the JSON. Failure modes — protocol error, bad JSON — fail the test.
+func readStatsDaily(t *testing.T, s *Server, uri string) dailyStatsResponse {
+	t.Helper()
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: uri}
+	result, err := s.handleStatsDailyResource(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleStatsDailyResource(%q): %v", uri, err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(result.Contents))
+	}
+	var resp dailyStatsResponse
+	if err := json.Unmarshal([]byte(result.Contents[0].Text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return resp
+}
+
+func TestStatsDaily_DefaultRangeReturns31Days(t *testing.T) {
+	// Default span: from = to - 30, both inclusive → 31 zero-filled rows.
+	// Locking the inclusive-math choice into the test so downstream clients
+	// can rely on it.
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	resp := readStatsDaily(t, s, "reverie://stats/daily")
+	if len(resp.Days) != 31 {
+		t.Errorf("len(Days) = %d, want 31 (inclusive 30-day default lookback)", len(resp.Days))
+	}
+	if resp.From == "" || resp.To == "" {
+		t.Errorf("from/to should be populated: from=%q to=%q", resp.From, resp.To)
+	}
+	// Today is the last day in the default window.
+	today := time.Now().UTC().Format("2006-01-02")
+	if resp.To != today {
+		t.Errorf("to = %q, want %q", resp.To, today)
+	}
+	// All rows zero-valued on a fresh (memStore) backend.
+	for i, d := range resp.Days {
+		if d.FactsIn+d.FactsOut+d.EpisodesIn+d.EpisodesOut+d.Supersedes != 0 {
+			t.Errorf("day[%d] %+v should be all-zero on fresh store", i, d)
+		}
+	}
+	// Dates are strictly ascending, continuous.
+	for i := 1; i < len(resp.Days); i++ {
+		if resp.Days[i].Date <= resp.Days[i-1].Date {
+			t.Errorf("dates not strictly ascending at %d: %s then %s", i, resp.Days[i-1].Date, resp.Days[i].Date)
+		}
+	}
+}
+
+func TestStatsDaily_ExplicitRangeAndGapFill(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// 5-day window. memStore returns no rows, so all should be zero-filled.
+	resp := readStatsDaily(t, s, "reverie://stats/daily?from=2026-01-01&to=2026-01-05")
+	if resp.From != "2026-01-01" || resp.To != "2026-01-05" {
+		t.Errorf("from/to = %s..%s, want 2026-01-01..2026-01-05", resp.From, resp.To)
+	}
+	if len(resp.Days) != 5 {
+		t.Fatalf("len(Days) = %d, want 5", len(resp.Days))
+	}
+	wantDates := []string{"2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"}
+	for i, want := range wantDates {
+		if resp.Days[i].Date != want {
+			t.Errorf("day[%d].Date = %s, want %s", i, resp.Days[i].Date, want)
+		}
+	}
+}
+
+func TestStatsDaily_FromAfterToErrors(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://stats/daily?from=2026-02-01&to=2026-01-01"}
+	_, err := s.handleStatsDailyResource(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for from > to")
+	}
+	if !strings.Contains(err.Error(), "must be <= to") {
+		t.Errorf("err = %v, want 'must be <= to'", err)
+	}
+}
+
+func TestStatsDaily_SpanTooLongErrors(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// 366 days from 2025-01-01 to 2026-01-01 exceeds the 365-day cap.
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://stats/daily?from=2025-01-01&to=2026-01-01"}
+	_, err := s.handleStatsDailyResource(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for span > 365 days")
+	}
+	if !strings.Contains(err.Error(), "exceeds max") {
+		t.Errorf("err = %v, want 'exceeds max'", err)
+	}
+}
+
+func TestStatsDaily_EmptyStoreZeroesNotError(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// A one-day range on a fresh store should return one zero row.
+	resp := readStatsDaily(t, s, "reverie://stats/daily?from=2026-04-18&to=2026-04-18")
+	if len(resp.Days) != 1 {
+		t.Fatalf("len(Days) = %d, want 1", len(resp.Days))
+	}
+	d := resp.Days[0]
+	if d.Date != "2026-04-18" {
+		t.Errorf("date = %s, want 2026-04-18", d.Date)
+	}
+	if d.FactsIn != 0 || d.FactsOut != 0 || d.EpisodesIn != 0 || d.EpisodesOut != 0 || d.Supersedes != 0 {
+		t.Errorf("expected all-zero row, got %+v", d)
+	}
+}
+
+func TestStatsDaily_InvalidDateFormat(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://stats/daily?from=not-a-date"}
+	if _, err := s.handleStatsDailyResource(context.Background(), req); err == nil {
+		t.Error("expected error for malformed from")
+	}
+}

@@ -221,8 +221,30 @@ type Store interface {
 	// ordered by descending similarity and capped at limit.
 	FindSimilarFacts(ctx context.Context, subtype string, queryVec []float32, threshold float32, limit int) ([]Candidate, error)
 
+	// --- Observability (Phase 5C) ---
+
+	// ListDailyStats returns the per-day activity rows inside the inclusive
+	// [from, to] range (YYYY-MM-DD, UTC). Rows are sorted ascending by date.
+	// The returned slice contains only dates for which a daily_stats row
+	// exists — callers that need zero-filled gaps must expand the range
+	// themselves. Implementations without trigger-driven stats (e.g. the
+	// in-memory test store) return an empty slice with no error.
+	ListDailyStats(ctx context.Context, from, to string) ([]DailyStats, error)
+
 	// Close releases any resources held by the store (e.g., database connections).
 	Close() error
+}
+
+// DailyStats is a single row of the daily_stats table — per-day counters for
+// memory activity. Fields mirror the table columns. The SQLite store
+// maintains these via triggers on facts/episodes; see migration 3.
+type DailyStats struct {
+	Date        string `json:"date"` // "YYYY-MM-DD" in UTC
+	FactsIn     int    `json:"facts_in"`
+	FactsOut    int    `json:"facts_out"`
+	EpisodesIn  int    `json:"episodes_in"`
+	EpisodesOut int    `json:"episodes_out"`
+	Supersedes  int    `json:"supersedes"`
 }
 
 // ListFilter specifies criteria for listing facts and episodes.

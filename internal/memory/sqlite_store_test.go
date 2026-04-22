@@ -2309,3 +2309,168 @@ func TestSQLiteClearFactSuperseded_NonexistentID(t *testing.T) {
 		t.Errorf("error = %q, want to contain %q", err.Error(), "not found")
 	}
 }
+
+// --- Phase 5C: daily_stats triggers + ListDailyStats ---
+
+// todayUTC returns the YYYY-MM-DD string for the current UTC date, matching
+// what the SQLite date('now') call inside the triggers produces.
+func todayUTC() string {
+	return time.Now().UTC().Format("2006-01-02")
+}
+
+// readDailyStatsRow returns the counters for the given date. Missing rows
+// surface as zeroes — matching the zero-fill semantics the resource handler
+// uses downstream.
+func readDailyStatsRow(t *testing.T, s *sqliteStore, date string) (factsIn, factsOut, episodesIn, episodesOut, supersedes int) {
+	t.Helper()
+	err := s.db.QueryRow(
+		`SELECT facts_in, facts_out, episodes_in, episodes_out, supersedes
+		 FROM daily_stats WHERE date = ?`, date,
+	).Scan(&factsIn, &factsOut, &episodesIn, &episodesOut, &supersedes)
+	if err != nil {
+		return 0, 0, 0, 0, 0
+	}
+	return
+}
+
+func TestSQLiteDailyStats_FactInsertIncrementsFactsIn(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := s.InsertFact(ctx, testdataFacts()[0]); err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+	fin, _, _, _, _ := readDailyStatsRow(t, s, todayUTC())
+	if fin != 1 {
+		t.Errorf("facts_in = %d, want 1", fin)
+	}
+}
+
+func TestSQLiteDailyStats_FactDeleteIncrementsFactsOut(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	id, err := s.InsertFact(ctx, testdataFacts()[0])
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+	if err := s.DeleteFact(ctx, id); err != nil {
+		t.Fatalf("DeleteFact: %v", err)
+	}
+	_, fout, _, _, _ := readDailyStatsRow(t, s, todayUTC())
+	if fout != 1 {
+		t.Errorf("facts_out = %d, want 1", fout)
+	}
+}
+
+func TestSQLiteDailyStats_SupersedeIncrementsSupersedes(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	facts := testdataFacts()
+	// Insert two facts; supersede the first by the second directly via raw
+	// UPDATE so the trigger sees the exact NULL→non-NULL transition it's
+	// guarded on. (Going through a similarity-driven path would make the
+	// test depend on assigner behavior.)
+	id1, err := s.InsertFact(ctx, facts[0])
+	if err != nil {
+		t.Fatalf("InsertFact 0: %v", err)
+	}
+	id2, err := s.InsertFact(ctx, facts[1])
+	if err != nil {
+		t.Fatalf("InsertFact 1: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET superseded_by = ? WHERE id = ?`, id2, id1,
+	); err != nil {
+		t.Fatalf("UPDATE supersede: %v", err)
+	}
+	_, _, _, _, sup := readDailyStatsRow(t, s, todayUTC())
+	if sup != 1 {
+		t.Errorf("supersedes = %d, want 1", sup)
+	}
+}
+
+func TestSQLiteDailyStats_EpisodeInsertIncrementsEpisodesIn(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := s.InsertEpisode(ctx, testdataEpisodes()[0]); err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+	_, _, ein, _, _ := readDailyStatsRow(t, s, todayUTC())
+	if ein != 1 {
+		t.Errorf("episodes_in = %d, want 1", ein)
+	}
+}
+
+func TestSQLiteDailyStats_EpisodeDeleteIncrementsEpisodesOut(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	id, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+	if err := s.DeleteEpisode(ctx, id); err != nil {
+		t.Fatalf("DeleteEpisode: %v", err)
+	}
+	_, _, _, eout, _ := readDailyStatsRow(t, s, todayUTC())
+	if eout != 1 {
+		t.Errorf("episodes_out = %d, want 1", eout)
+	}
+}
+
+func TestSQLiteListDailyStats_RangeQuery(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	// Seed three distinct dates by inserting one fact per day and then
+	// rewriting the daily_stats row via raw SQL (so we control exact dates).
+	// Going through the trigger and then mutating the row afterwards keeps
+	// the schema consistent.
+	dates := []string{"2026-03-01", "2026-03-05", "2026-03-10"}
+	for i, d := range dates {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO daily_stats (date, facts_in) VALUES (?, ?)`, d, i+1,
+		); err != nil {
+			t.Fatalf("seed row %s: %v", d, err)
+		}
+	}
+
+	got, err := s.ListDailyStats(ctx, "2026-03-01", "2026-03-07")
+	if err != nil {
+		t.Fatalf("ListDailyStats: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2 (inclusive 03-01..03-07)", len(got))
+	}
+	// Ascending order.
+	if got[0].Date != "2026-03-01" || got[1].Date != "2026-03-05" {
+		t.Errorf("dates = [%s %s], want [2026-03-01 2026-03-05]", got[0].Date, got[1].Date)
+	}
+	if got[0].FactsIn != 1 || got[1].FactsIn != 2 {
+		t.Errorf("facts_in = [%d %d], want [1 2]", got[0].FactsIn, got[1].FactsIn)
+	}
+
+	// Full range captures everything.
+	all, err := s.ListDailyStats(ctx, "2026-03-01", "2026-03-31")
+	if err != nil {
+		t.Fatalf("ListDailyStats full: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("full range len = %d, want 3", len(all))
+	}
+
+	// Empty range returns empty slice (not nil).
+	none, err := s.ListDailyStats(ctx, "2025-01-01", "2025-01-05")
+	if err != nil {
+		t.Fatalf("ListDailyStats empty: %v", err)
+	}
+	if none == nil {
+		t.Error("empty range returned nil; want empty slice")
+	}
+	if len(none) != 0 {
+		t.Errorf("empty range len = %d, want 0", len(none))
+	}
+}

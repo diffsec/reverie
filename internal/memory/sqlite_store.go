@@ -1319,6 +1319,38 @@ func (s *sqliteStore) FindSimilarFacts(ctx context.Context, subtype string, quer
 	return candidates, nil
 }
 
+// ListDailyStats returns rows from daily_stats where date falls in [from, to]
+// inclusive. Dates are "YYYY-MM-DD" UTC strings; the caller is responsible
+// for validating the range and for zero-filling gaps. Rows are sorted
+// ascending by date (oldest first). Returns an empty slice (not nil) when
+// no rows match.
+func (s *sqliteStore) ListDailyStats(ctx context.Context, from, to string) ([]DailyStats, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT date, facts_in, facts_out, episodes_in, episodes_out, supersedes
+		 FROM daily_stats
+		 WHERE date BETWEEN ? AND ?
+		 ORDER BY date ASC`,
+		from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: list daily stats: %w", err)
+	}
+	defer rows.Close()
+
+	out := []DailyStats{}
+	for rows.Next() {
+		var d DailyStats
+		if err := rows.Scan(&d.Date, &d.FactsIn, &d.FactsOut, &d.EpisodesIn, &d.EpisodesOut, &d.Supersedes); err != nil {
+			return nil, fmt.Errorf("sqlite store: list daily stats: scan: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite store: list daily stats: rows: %w", err)
+	}
+	return out, nil
+}
+
 func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
