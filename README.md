@@ -6,12 +6,24 @@ Reverie is an MCP server that implements the Oblivion memory architecture (arXiv
 
 ## Quick start
 
+The fastest path: clone and run the installer. It builds the binary, pulls the Ollama embedding model if missing, and wires reverie into Claude Code and/or Claude Desktop (whichever it finds), preserving any existing MCP server entries.
+
+```bash
+git clone https://github.com/ihavespoons/reverie.git
+cd reverie
+./scripts/install.sh
+```
+
+The installer is re-run safe (existing config is backed up before merge) and supports `--code-only`, `--desktop-only`, `--skip-ollama`, and `--uninstall` flags. See `./scripts/install.sh --help`.
+
+### Manual install
+
 ```bash
 # Prerequisites: Go 1.22+, Ollama with nomic-embed-text
 ollama pull nomic-embed-text
 
 # Build
-go build -o reverie ./cmd/reverie
+go install ./cmd/reverie
 
 # Run as an MCP server (Claude Code will invoke this)
 reverie serve
