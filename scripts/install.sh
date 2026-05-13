@@ -129,6 +129,76 @@ remove_config() {
     ok "$label: removed reverie entry (backup at $backup)"
 }
 
+add_claude_code_via_cli() {
+    # Claude Code reads MCP servers from ~/.claude.json, not from
+    # ~/.claude/settings.json. The canonical way to add a user-scope server
+    # is `claude mcp add --scope user`, which writes to the correct file
+    # and validates the entry.
+    local bin="$1"
+    local label="Claude Code"
+
+    if ! command -v claude >/dev/null 2>&1; then
+        warn "$label: 'claude' CLI not in PATH -- skipping"
+        warn "$label: install Claude Code and re-run, or register manually:"
+        warn "         claude mcp add --scope user reverie $bin serve"
+        return
+    fi
+
+    # Clean up any stale entry under ~/.claude/settings.json left by older
+    # versions of this installer that wrote MCP config to the wrong file.
+    if [ -e "$CODE_CONFIG" ] && jq -e '.mcpServers.reverie' "$CODE_CONFIG" >/dev/null 2>&1; then
+        local backup="$CODE_CONFIG.bak.$(date +%s)"
+        cp "$CODE_CONFIG" "$backup"
+        local stripped
+        stripped=$(jq 'del(.mcpServers.reverie) | if (.mcpServers // {}) == {} then del(.mcpServers) else . end' "$CODE_CONFIG") \
+            || fail "$label: jq strip of stale settings.json entry failed"
+        printf '%s\n' "$stripped" > "$CODE_CONFIG"
+        ok "$label: removed stale entry from $CODE_CONFIG (backup at $backup) -- MCP servers belong in ~/.claude.json"
+    fi
+
+    if claude mcp get reverie >/dev/null 2>&1; then
+        info "$label: reverie already registered, replacing"
+        claude mcp remove reverie >/dev/null 2>&1 \
+            || warn "$label: 'claude mcp remove' returned non-zero, continuing"
+    fi
+
+    if claude mcp add --scope user reverie "$bin" serve >/dev/null 2>&1; then
+        ok "$label: wired reverie via 'claude mcp add --scope user'"
+    else
+        fail "$label: 'claude mcp add' failed -- run it manually to see the error"
+    fi
+}
+
+remove_claude_code_via_cli() {
+    local label="Claude Code"
+
+    # Strip any stale settings.json entry from older installers regardless of
+    # whether the CLI is present.
+    if [ -e "$CODE_CONFIG" ] && jq -e '.mcpServers.reverie' "$CODE_CONFIG" >/dev/null 2>&1; then
+        local backup="$CODE_CONFIG.bak.$(date +%s)"
+        cp "$CODE_CONFIG" "$backup"
+        local stripped
+        stripped=$(jq 'del(.mcpServers.reverie) | if (.mcpServers // {}) == {} then del(.mcpServers) else . end' "$CODE_CONFIG") \
+            || fail "$label: jq strip of stale settings.json entry failed"
+        printf '%s\n' "$stripped" > "$CODE_CONFIG"
+        ok "$label: removed stale entry from $CODE_CONFIG (backup at $backup)"
+    fi
+
+    if ! command -v claude >/dev/null 2>&1; then
+        info "$label: 'claude' CLI not in PATH, nothing more to remove"
+        return
+    fi
+    if ! claude mcp get reverie >/dev/null 2>&1; then
+        info "$label: no reverie entry registered with claude mcp"
+        return
+    fi
+    if claude mcp remove reverie >/dev/null 2>&1; then
+        ok "$label: removed reverie entry via 'claude mcp remove'"
+    else
+        warn "$label: 'claude mcp remove' returned non-zero"
+    fi
+}
+
 merge_opencode_config() {
     # Args: $1 = config path, $2 = binary path, $3 = client label (for messages)
     # OpenCode uses a different schema -- `.mcp` (not `.mcpServers`) with
@@ -186,7 +256,7 @@ require_cmd jq "install via brew install jq, apt install jq, or equivalent"
 # --- uninstall path ---
 if [ "$UNINSTALL" -eq 1 ]; then
     info "uninstall mode"
-    [ "$DO_CODE"     -eq 1 ] && remove_config "$CODE_CONFIG"             "Claude Code"
+    [ "$DO_CODE"     -eq 1 ] && remove_claude_code_via_cli
     [ "$DO_DESKTOP"  -eq 1 ] && remove_config "$DESKTOP_CONFIG"          "Claude Desktop"
     [ "$DO_OPENCODE" -eq 1 ] && remove_opencode_config "$OPENCODE_CONFIG" "OpenCode"
     info "binary at $(command -v reverie 2>/dev/null || echo "<not on PATH>") left in place -- remove manually if desired"
@@ -253,11 +323,7 @@ ok "binary: $BIN"
 
 # --- configure clients ---
 if [ "$DO_CODE" -eq 1 ]; then
-    if [ -e "$CODE_CONFIG" ] || [ -d "$HOME/.claude" ]; then
-        merge_config "$CODE_CONFIG" "$BIN" "Claude Code"
-    else
-        info "Claude Code config dir not detected at ~/.claude — skipping (use --code-only to force)"
-    fi
+    add_claude_code_via_cli "$BIN"
 fi
 
 if [ "$DO_DESKTOP" -eq 1 ]; then

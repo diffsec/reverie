@@ -38,52 +38,33 @@ curl -s http://localhost:11434/v1/models | head -5
 
 If Ollama isn't running when reverie starts, `memory_write` and `memory_recall` return clean errors -- no data is corrupted.
 
-## 3. Add to settings.json
+## 3. Register the MCP server
 
-Edit `~/.claude/settings.json` and add the `reverie` entry under `mcpServers`:
+Use the `claude mcp` CLI -- this writes the entry to `~/.claude.json` (the file Claude Code actually reads MCP servers from). Do NOT hand-edit `~/.claude/settings.json` for MCP config; it is the wrong file and is ignored.
 
-```json
-{
-  "mcpServers": {
-    "reverie": {
-      "type": "stdio",
-      "command": "reverie",
-      "args": ["serve"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user reverie "$(command -v reverie || echo $(go env GOPATH)/bin/reverie)" serve
 ```
 
-If `reverie` isn't on your `$PATH`, use the full path:
+Or with an absolute path:
 
-```json
-{
-  "mcpServers": {
-    "reverie": {
-      "type": "stdio",
-      "command": "/Users/you/Code/personal/reverie/reverie",
-      "args": ["serve"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user reverie /Users/you/Code/reverie/reverie serve
 ```
 
-No API keys or `env` block needed with Ollama. If using Voyage instead:
+No API keys or env vars are needed with Ollama. If using Voyage instead, pass the key with `-e`:
 
-```json
-{
-  "mcpServers": {
-    "reverie": {
-      "type": "stdio",
-      "command": "reverie",
-      "args": ["serve"],
-      "env": {
-        "VOYAGE_API_KEY": "${VOYAGE_API_KEY}"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --scope user -e VOYAGE_API_KEY="$VOYAGE_API_KEY" reverie reverie serve
 ```
+
+Verify it landed:
+
+```bash
+claude mcp list
+```
+
+You should see `reverie: ... - ✓ Connected`.
 
 ## 4. Add the reverie preamble to CLAUDE.md
 
@@ -132,7 +113,7 @@ Start a Claude Code session and run `/mcp`. You should see `reverie` listed as a
 
 If reverie is not listed, check:
 - Is Ollama running? (`ollama list` should show `nomic-embed-text`)
-- Is the binary path correct in settings.json?
+- Is the binary path correct? (`claude mcp get reverie` to inspect)
 - Check stderr output: `reverie serve 2>reverie.log` and inspect `reverie.log`.
 
 ## 7. Test

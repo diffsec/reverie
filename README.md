@@ -34,25 +34,17 @@ reverie status
 
 ## Claude Code setup
 
-Add to `~/.claude/settings.json`:
+Register the server with the `claude mcp` CLI -- it writes to `~/.claude.json` (the file Claude Code reads MCP entries from; `~/.claude/settings.json` is the wrong file and is ignored):
 
-```json
-{
-  "mcpServers": {
-    "reverie": {
-      "type": "stdio",
-      "command": "/path/to/reverie",
-      "args": ["serve"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user reverie /path/to/reverie serve
 ```
 
 Replace `/path/to/reverie` with the actual binary path (e.g., the output of `go env GOPATH`/bin/reverie if installed via `go install`).
 
-No API keys needed with Ollama. For Voyage, add `"env": {"VOYAGE_API_KEY": "${VOYAGE_API_KEY}"}`.
+No API keys needed with Ollama. For Voyage, pass the key with `-e VOYAGE_API_KEY="$VOYAGE_API_KEY"`.
 
-Restart Claude Code after adding the entry.
+Verify with `claude mcp list`. Restart Claude Code after adding the entry.
 
 See [docs/claude-code-setup.md](docs/claude-code-setup.md) for the full setup guide including the CLAUDE.md preamble.
 
