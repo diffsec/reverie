@@ -289,4 +289,4 @@ Landing order:
 ## Forward references
 
 - Phase 3 (3A) `dry_run` on `memory_write` reuses the conflict-detection path; if we expose supersede candidates in dry-run, that format mirrors `memory_get`'s `supersedes` field from Phase 1.
-- Phase 4 `memory_unlink` does NOT replace 2D's link-clearing behavior; they're different affordances (2D for full replacement, Phase 4 for surgical edits).
+- Phase 4 `memory_edge_remove` does NOT replace 2D's link-clearing behavior; they're different affordances (2D for full replacement, Phase 4 for surgical edits).

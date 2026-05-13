@@ -1,0 +1,3 @@
+# Local build artifact from `go build -o reverie ./cmd/reverie`.
+# Canonical install goes to $GOPATH/bin via `go install ./cmd/reverie`.
+/reverie

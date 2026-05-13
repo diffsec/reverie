@@ -121,6 +121,8 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
                                              |   +-- clusters (L1)         |
                                              |   +-- facts (L2)            |
                                              |   +-- episodes (L3)         |
+                                             |   +-- entities (L-graph)    |
+                                             |   +-- edges (L-graph)       |
                                              |   +-- embedding_cache       |
                                              +-----------------------------+
 ```
@@ -140,6 +142,7 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 | project | L2 | Codebase facts, conventions, architecture |
 | reference | L2 | Pointers to URLs, repos, external docs |
 | episode | L3 | Situation, action, outcome, lesson |
+| entity | L-graph | First-class nodes (files, repos, libraries, concepts) referenced by memory mentions; decay like clusters. |
 
 ## Tools
 
@@ -156,6 +159,12 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 | `memory_session_snapshot` | Force-flush the current buffer to the session store. | Explicit checkpoint; normally implicit after each mutation. |
 | `memory_session_restore` | Read the buffer and metadata for a session without `init` semantics. | Inspection / audit. |
 | `memory_session_end` | Close a session, run a scoped decay tick, optionally write an L3 episode. | End of conversation. |
+| `memory_edge_add` | Add a typed directed edge between two memories or entities. | When the host classifies a relation (causes/refines/contradicts/...) between two known nodes. |
+| `memory_edge_remove` | Remove a specific edge; idempotent on missing. | On correction or stale-link cleanup. |
+| `memory_edge_list` | List edges incident to a memory or entity, up to N hops (1-3). | Walk the graph to find related context. |
+| `memory_entity_upsert` | Create or dedupe an entity by (name, entity_type); exact match then similarity fallback. | After noticing a recurring named thing (file, library, concept). |
+| `memory_entity_mention` | Attach a memory to one or more entities; idempotent. | Right after `memory_write` when the host has extracted entities from the new memory. |
+| `memory_entity_neighbors` | Walk the graph from an entity to nearby memories and entities. | To answer "what do I know about X" queries. |
 
 ## Resources
 
@@ -175,6 +184,26 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 |---|---|
 | `session_start` | Walk through `memory_session_init` + `reverie://l1/index` + session-scoped `memory_recall`. Takes `session_id` (required) and `project_hint` (optional). |
 | `session_end` | Walk through `memory_session_end` (with optional episode payload). Takes `session_id` (required). |
+
+## Knowledge graph
+
+Reverie's graph layer connects memories (L2 facts, L3 episodes) and entities through typed directed edges. Edge types and entity types are caller-supplied strings -- nothing is enforced at the schema layer -- but the lists below are the canonical taxonomy the system understands.
+
+### Edge types
+
+- `evidence` -- supporting reference (episodes evidencing facts, citations).
+- `causes` -- cause-to-effect relationship.
+- `contradicts` -- known conflict between two memories.
+- `supports` -- soft endorsement (weaker than `evidence`).
+- `refines` -- successor that clarifies or extends without superseding.
+- `depends_on` -- prerequisite relationship.
+- `references` -- non-directional pointer; default for generic links.
+
+### Entity types
+
+- `file`, `repo`, `library`, `concept`, `person`, `command` -- the hosts' typical extractions.
+- Free-form: callers can store any string; reverie does not enforce a closed set.
+- Dedup: two entities with the same `(name, entity_type)` always merge; entities differing only in `entity_type` are distinct, so `"foo" (file)` and `"foo" (concept)` are two different entities.
 
 ## Configuration
 
