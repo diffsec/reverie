@@ -236,16 +236,75 @@ type Session struct {
 	ClosedAt    *time.Time    `json:"closed_at,omitempty"`
 }
 
-// EpisodeLink describes a cross-type link from a fact to an episode.
-type EpisodeLink struct {
-	EpisodeID string   `json:"episode_id"`
-	LinkType  string   `json:"link_type"`
-	Episode   *Episode `json:"episode,omitempty"` // eager-loaded for convenience
+// --- Phase 7 knowledge graph ---
+
+// Edge represents a typed directed relationship between two memories
+// (facts/episodes) or entities. The src_id and dst_id are polymorphic --
+// the application is responsible for interpreting which table each ID
+// belongs to. Retention is computed on read, not stored.
+type Edge struct {
+	SrcID     string
+	DstID     string
+	EdgeType  string
+	Weight    float64
+	CreatedAt time.Time
 }
 
-// FactLink describes a cross-type link from an episode to a fact.
-type FactLink struct {
-	FactID   string `json:"fact_id"`
-	LinkType string `json:"link_type"`
-	Fact     *Fact  `json:"fact,omitempty"` // eager-loaded for convenience
+// Entity is a first-class node in the knowledge graph (file, repo,
+// library, concept, person, command, ...). Entities decay using the same
+// Ebbinghaus formula as L1 clusters.
+type Entity struct {
+	ID         string
+	Name       string
+	EntityType string // "file", "repo", "library", "concept", "person", "command", ...
+	Embedding  []float32
+	Utility    float64
+	Frequency  float64
+	TurnsSince int
+	Retention  float64
+	LastAccess time.Time
+	CreatedAt  time.Time
+}
+
+// Mention links a memory (fact or episode) to an entity it mentions.
+// Memory->entity only -- entity->entity goes through Edge.
+type Mention struct {
+	MemoryID string
+	EntityID string
+	Role     string // advisory: "subject", "object", "mention"
+}
+
+// EdgeWithDistance is an edge annotated with its BFS distance from the
+// seed memory ID passed to ListEdges. The "other" endpoint is implicit:
+// it is whichever of SrcID/DstID is not the seed (or its k-hop ancestor).
+type EdgeWithDistance struct {
+	Edge     Edge
+	Distance int // hops from the seed memory (1..hops)
+}
+
+// EntityWithScore pairs an Entity with its cosine similarity to a query
+// vector. Used as the return type of FindSimilarEntities, mirroring the
+// Candidate shape used by FindSimilarFacts.
+type EntityWithScore struct {
+	Entity     Entity
+	Similarity float32
+}
+
+// NeighborMemory is a memory (fact or episode) reached during an
+// entity-neighbor walk. Layer is "l2_semantic" or "l3_episodic".
+// ContentPreview is truncated to 120 chars; the layered fact-then-episode
+// lookup that populates Layer also fills this field.
+type NeighborMemory struct {
+	ID             string
+	Layer          MemoryType
+	ContentPreview string
+	Distance       int
+}
+
+// NeighborEntity is an entity reached during an entity-neighbor walk.
+type NeighborEntity struct {
+	ID         string
+	Name       string
+	EntityType string
+	Distance   int
 }

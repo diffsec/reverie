@@ -23,8 +23,16 @@ type MemoryManager interface {
 
 	// TickDecay increments turns_since on every cluster, then resets
 	// turns_since to 0 for the clusters named in accessedClusterIDs.
-	// Should be called once per write-path turn.
+	// Should be called once per write-path turn. Entities are bumped as
+	// well, with an empty access set (the write path doesn't know which
+	// entities were touched). Thin wrapper around TickDecayWithEntities.
 	TickDecay(ctx context.Context, accessedClusterIDs []string) error
+
+	// TickDecayWithEntities is the entity-aware variant of TickDecay used
+	// at session-end. Order of operations: TickAllClusters →
+	// TickAllEntities → SetLastTick. A failure on either tick is
+	// surfaced immediately and SetLastTick is NOT recorded.
+	TickDecayWithEntities(ctx context.Context, accessedClusterIDs, accessedEntityIDs []string) error
 }
 
 // decayer is the local interface shape MemoryManager needs from a Decayer.
@@ -124,15 +132,28 @@ func (mm *memoryManager) Reinforce(ctx context.Context, credits map[string]float
 	return nil
 }
 
-// TickDecay delegates to Store.TickAllClusters: increments turns_since on every
-// cluster by 1, then resets to 0 for the clusters in accessedClusterIDs. On
-// success it records the current UTC time as the "last tick" via
-// Store.SetLastTick so reverie://status can surface when decay last ran.
-// A SetLastTick failure after a successful tick is surfaced as a wrapped
-// error; the tick itself already committed.
+// TickDecay is a thin wrapper around TickDecayWithEntities that bumps
+// clusters (resetting accessedClusterIDs) and ALL entities (with an
+// empty access set). The write path uses this — it doesn't know which
+// entities the turn touched. The session-end path calls
+// TickDecayWithEntities directly so it can attribute entity hits to the
+// memories in the session buffer.
 func (mm *memoryManager) TickDecay(ctx context.Context, accessedClusterIDs []string) error {
+	return mm.TickDecayWithEntities(ctx, accessedClusterIDs, nil)
+}
+
+// TickDecayWithEntities runs both decay tick paths in order: clusters
+// first, then entities, then records the last-tick timestamp. Either
+// tick failure short-circuits and skips SetLastTick — the next attempt
+// will retry from a known-bad state rather than papering over the
+// partial commit. A SetLastTick failure after both ticks succeed is
+// surfaced as a wrapped error; the ticks themselves already committed.
+func (mm *memoryManager) TickDecayWithEntities(ctx context.Context, accessedClusterIDs, accessedEntityIDs []string) error {
 	if err := mm.store.TickAllClusters(ctx, accessedClusterIDs); err != nil {
-		return fmt.Errorf("manager: tick decay: %w", err)
+		return fmt.Errorf("manager: tick decay: clusters: %w", err)
+	}
+	if err := mm.store.TickAllEntities(ctx, accessedEntityIDs); err != nil {
+		return fmt.Errorf("manager: tick decay: entities: %w", err)
 	}
 	if err := mm.store.SetLastTick(ctx, time.Now().UTC()); err != nil {
 		return fmt.Errorf("manager: tick decay: record last tick: %w", err)

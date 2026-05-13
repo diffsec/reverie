@@ -2596,8 +2596,13 @@ func TestHandleGet_LinksBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleWrite episode: %v", err)
 	}
-	if _, err := s.store.LinkFactEpisode(ctx, fOut.ID, eOut.ID, "related"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
+	// Seed an evidence edge through the store layer. memory_get filters
+	// to edge_type=="evidence" — non-evidence edges are not surfaced as
+	// LinkRefs in the response.
+	if _, err := s.store.AddEdge(ctx, memory.Edge{
+		SrcID: fOut.ID, DstID: eOut.ID, EdgeType: "evidence", Weight: 1.0,
+	}); err != nil {
+		t.Fatalf("AddEdge: %v", err)
 	}
 
 	// Fact side advertises the episode link.
@@ -4972,11 +4977,11 @@ func TestHandleUnsupersede_ListFactsReflectsRevival(t *testing.T) {
 	}
 }
 
-// --- Phase 4A: memory_link / memory_unlink / memory_list_links tests ---
+// --- Phase 7: knowledge graph tool tests ---
 
-// seedLinkServer builds a test server with one fact and one episode and returns
-// the (server, factID, episodeID).
-func seedLinkServer(t *testing.T) (*Server, string, string) {
+// seedKGServer builds a test server with one fact and one episode and returns
+// the (server, factID, episodeID). Replacement for the retired seedLinkServer.
+func seedKGServer(t *testing.T) (*Server, string, string) {
 	t.Helper()
 	emb := newStubEmbedder(4)
 	emb.vectors["fact content"] = []float32{0.5, 0.5, 0.0, 0.0}
@@ -5001,249 +5006,460 @@ func seedLinkServer(t *testing.T) (*Server, string, string) {
 	return s, fOut.ID, eOut.ID
 }
 
-func TestHandleLink_Created(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeAdd_HappyPath(t *testing.T) {
+	s, factID, epID := seedKGServer(t)
 	ctx := context.Background()
 
-	_, out, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	// Default weight path.
+	_, out, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence",
+	})
 	if err != nil {
-		t.Fatalf("handleLink: %v", err)
+		t.Fatalf("handleEdgeAdd: %v", err)
 	}
 	if !out.Created {
-		t.Error("Created = false on fresh link, want true")
+		t.Error("Created = false on fresh edge, want true")
 	}
-	if out.LinkType != "evidence" {
-		t.Errorf("LinkType = %q, want %q (default)", out.LinkType, "evidence")
+	if out.Weight != 1.0 {
+		t.Errorf("Weight = %v, want 1.0 (default)", out.Weight)
 	}
-	if out.FactID != factID || out.EpisodeID != epID {
-		t.Errorf("IDs mismatch: fact %q (want %q), episode %q (want %q)",
-			out.FactID, factID, out.EpisodeID, epID)
+	if out.SrcID != factID || out.DstID != epID || out.EdgeType != "evidence" {
+		t.Errorf("echo mismatch: %+v", out)
 	}
 
-	// Link is observable via memory_list_links.
-	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	// Explicit-weight path: a distinct edge_type so we don't hit the
+	// idempotent dedup of the previous insert.
+	weight := 2.5
+	_, out2, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: epID, EdgeType: "refines", Weight: &weight,
+	})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
+		t.Fatalf("handleEdgeAdd with weight: %v", err)
 	}
-	if len(listOut.Links) != 1 || listOut.Links[0].ID != epID {
-		t.Errorf("list links from fact = %+v, want one link to %s", listOut.Links, epID)
+	if !out2.Created {
+		t.Error("second Created = false, want true (distinct edge_type)")
+	}
+	if out2.Weight != 2.5 {
+		t.Errorf("Weight = %v, want 2.5", out2.Weight)
 	}
 }
 
-func TestHandleLink_Idempotent(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeAdd_Idempotent(t *testing.T) {
+	s, factID, epID := seedKGServer(t)
 	ctx := context.Background()
 
-	_, first, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	// First call with weight=1.0 (default).
+	_, first, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{SrcID: factID, DstID: epID, EdgeType: "evidence"})
 	if err != nil {
-		t.Fatalf("handleLink first: %v", err)
+		t.Fatalf("handleEdgeAdd first: %v", err)
 	}
 	if !first.Created {
 		t.Error("first Created = false, want true")
 	}
+	if first.Weight != 1.0 {
+		t.Errorf("first Weight = %v, want 1.0", first.Weight)
+	}
 
-	_, second, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	// Second call with a DIFFERENT weight — the stored weight must be
+	// returned, not the input weight (per locked decision in design doc).
+	differentWeight := 5.0
+	_, second, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence", Weight: &differentWeight,
+	})
 	if err != nil {
-		t.Fatalf("handleLink second: %v", err)
+		t.Fatalf("handleEdgeAdd second: %v", err)
 	}
 	if second.Created {
 		t.Error("second Created = true, want false (idempotent)")
 	}
+	if second.Weight != 1.0 {
+		t.Errorf("second Weight = %v, want 1.0 (stored value, not input)", second.Weight)
+	}
 }
 
-func TestHandleLink_WrongLayerFact(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeAdd_UnknownID(t *testing.T) {
+	s, factID, _ := seedKGServer(t)
 	ctx := context.Background()
 
-	// factID supplied as episode_id → episode-is-a-fact error.
-	_, _, err := s.handleLink(ctx, nil, LinkInput{FactID: epID, EpisodeID: factID})
+	_, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: "no-such-src", DstID: "no-such-dst", EdgeType: "evidence",
+	})
 	if err == nil {
-		t.Fatal("expected error when fact_id is an episode")
+		t.Error("expected error for unknown src_id and dst_id")
 	}
-}
 
-func TestHandleLink_NonexistentIDs(t *testing.T) {
-	s, factID, _ := seedLinkServer(t)
-	ctx := context.Background()
-
-	_, _, err := s.handleLink(ctx, nil, LinkInput{FactID: "no-such-fact", EpisodeID: "no-such-ep"})
+	_, _, err = s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: "no-such-dst", EdgeType: "evidence",
+	})
 	if err == nil {
-		t.Error("expected error for nonexistent fact_id")
-	}
-
-	_, _, err = s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: "no-such-ep"})
-	if err == nil {
-		t.Error("expected error for nonexistent episode_id")
+		t.Error("expected error for unknown dst_id")
 	}
 }
 
-func TestHandleLink_CustomLinkType(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeRemove(t *testing.T) {
+	s, factID, epID := seedKGServer(t)
 	ctx := context.Background()
 
-	_, out, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID, LinkType: "cause"})
+	// Add first so the remove has a target.
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence",
+	}); err != nil {
+		t.Fatalf("handleEdgeAdd: %v", err)
+	}
+
+	_, out, err := s.handleEdgeRemove(ctx, nil, EdgeRemoveInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence",
+	})
 	if err != nil {
-		t.Fatalf("handleLink: %v", err)
-	}
-	if out.LinkType != "cause" {
-		t.Errorf("LinkType = %q, want %q", out.LinkType, "cause")
-	}
-
-	// Visible via memory_list_links.
-	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
-	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
-	}
-	if len(listOut.Links) != 1 || listOut.Links[0].LinkType != "cause" {
-		t.Errorf("list links = %+v, want one link with link_type=cause", listOut.Links)
-	}
-}
-
-func TestHandleUnlink_Existing(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
-	ctx := context.Background()
-
-	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
-		t.Fatalf("handleLink: %v", err)
-	}
-
-	_, out, err := s.handleUnlink(ctx, nil, UnlinkInput{FactID: factID, EpisodeID: epID})
-	if err != nil {
-		t.Fatalf("handleUnlink: %v", err)
+		t.Fatalf("handleEdgeRemove: %v", err)
 	}
 	if !out.Deleted {
 		t.Error("Deleted = false, want true")
 	}
 
-	// Confirm the link is gone.
-	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	// Removing again returns Deleted=false cleanly.
+	_, out, err = s.handleEdgeRemove(ctx, nil, EdgeRemoveInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence",
+	})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
-	}
-	if len(listOut.Links) != 0 {
-		t.Errorf("links after unlink = %+v, want empty", listOut.Links)
-	}
-}
-
-func TestHandleUnlink_Missing(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
-	ctx := context.Background()
-
-	_, out, err := s.handleUnlink(ctx, nil, UnlinkInput{FactID: factID, EpisodeID: epID})
-	if err != nil {
-		t.Fatalf("handleUnlink (no link): %v", err)
+		t.Fatalf("handleEdgeRemove second: %v", err)
 	}
 	if out.Deleted {
-		t.Error("Deleted = true, want false (no link existed)")
+		t.Error("Deleted = true on missing edge, want false")
 	}
 }
 
-func TestHandleListLinks_FromFact(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeList_OneHop(t *testing.T) {
+	s, factID, epID := seedKGServer(t)
 	ctx := context.Background()
 
-	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID, LinkType: "evidence"}); err != nil {
-		t.Fatalf("handleLink: %v", err)
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: factID, DstID: epID, EdgeType: "evidence",
+	}); err != nil {
+		t.Fatalf("handleEdgeAdd: %v", err)
 	}
 
-	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	_, out, err := s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: factID})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
+		t.Fatalf("handleEdgeList: %v", err)
 	}
 	if out.Layer != "l2_semantic" {
-		t.Errorf("queried-layer = %q, want l2_semantic", out.Layer)
+		t.Errorf("Layer = %q, want l2_semantic", out.Layer)
 	}
-	if len(out.Links) != 1 {
-		t.Fatalf("links = %d, want 1", len(out.Links))
+	if len(out.Edges) != 1 {
+		t.Fatalf("len(Edges) = %d, want 1", len(out.Edges))
 	}
-	if out.Links[0].ID != epID || out.Links[0].Layer != "l3_episodic" {
-		t.Errorf("link = %+v, want ID=%s layer=l3_episodic", out.Links[0], epID)
+	e := out.Edges[0]
+	if e.OtherID != epID {
+		t.Errorf("OtherID = %q, want %q", e.OtherID, epID)
 	}
-	if out.Links[0].ContentPreview == "" {
-		t.Error("ContentPreview empty, want episode content")
+	if e.OtherLayer != "l3_episodic" {
+		t.Errorf("OtherLayer = %q, want l3_episodic", e.OtherLayer)
+	}
+	if e.Distance != 1 {
+		t.Errorf("Distance = %d, want 1", e.Distance)
+	}
+	if e.EdgeType != "evidence" {
+		t.Errorf("EdgeType = %q, want evidence", e.EdgeType)
 	}
 }
 
-func TestHandleListLinks_FromEpisode(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeList_TwoHops(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["a"] = []float32{1, 0, 0, 0}
+	emb.vectors["b"] = []float32{0, 1, 0, 0}
+	emb.vectors["c"] = []float32{0, 0, 1, 0}
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
 	ctx := context.Background()
-
-	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
-		t.Fatalf("handleLink: %v", err)
-	}
-
-	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: epID})
+	_, aOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "a", Type: "project"})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
+		t.Fatalf("write a: %v", err)
 	}
-	if out.Layer != "l3_episodic" {
-		t.Errorf("queried-layer = %q, want l3_episodic", out.Layer)
-	}
-	if len(out.Links) != 1 {
-		t.Fatalf("links = %d, want 1", len(out.Links))
-	}
-	if out.Links[0].ID != factID || out.Links[0].Layer != "l2_semantic" {
-		t.Errorf("link = %+v, want ID=%s layer=l2_semantic", out.Links[0], factID)
-	}
-	if out.Links[0].ContentPreview != "fact content" {
-		t.Errorf("ContentPreview = %q, want \"fact content\"", out.Links[0].ContentPreview)
-	}
-}
-
-func TestHandleListLinks_Empty(t *testing.T) {
-	s, factID, _ := seedLinkServer(t)
-	ctx := context.Background()
-
-	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	_, bOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "b", Type: "project"})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
+		t.Fatalf("write b: %v", err)
 	}
-	if out.Links == nil {
-		t.Error("Links = nil, want empty non-nil slice")
+	_, cOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "c", Type: "project"})
+	if err != nil {
+		t.Fatalf("write c: %v", err)
 	}
-	if len(out.Links) != 0 {
-		t.Errorf("len(Links) = %d, want 0", len(out.Links))
+
+	// Chain a -> b -> c.
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: aOut.ID, DstID: bOut.ID, EdgeType: "refines",
+	}); err != nil {
+		t.Fatalf("add a->b: %v", err)
+	}
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: bOut.ID, DstID: cOut.ID, EdgeType: "refines",
+	}); err != nil {
+		t.Fatalf("add b->c: %v", err)
+	}
+
+	_, out, err := s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: aOut.ID, Hops: 2})
+	if err != nil {
+		t.Fatalf("handleEdgeList: %v", err)
+	}
+	if len(out.Edges) != 2 {
+		t.Fatalf("len(Edges) = %d, want 2", len(out.Edges))
+	}
+	distances := map[string]int{}
+	for _, e := range out.Edges {
+		distances[e.OtherID] = e.Distance
+	}
+	if distances[bOut.ID] != 1 {
+		t.Errorf("distance to b = %d, want 1", distances[bOut.ID])
+	}
+	if distances[cOut.ID] != 2 {
+		t.Errorf("distance to c = %d, want 2", distances[cOut.ID])
 	}
 }
 
-func TestHandleListLinks_NotFound(t *testing.T) {
-	s, _, _ := seedLinkServer(t)
+func TestHandleEdgeList_HopsOutOfRange(t *testing.T) {
+	s, factID, _ := seedKGServer(t)
 	ctx := context.Background()
 
-	_, _, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: "no-such-id"})
+	_, _, err := s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: factID, Hops: 4})
 	if err == nil {
-		t.Error("expected error for nonexistent memory_id")
+		t.Error("expected error for hops=4")
+	}
+	_, _, err = s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: factID, Hops: -1})
+	if err == nil {
+		t.Error("expected error for hops=-1")
 	}
 }
 
-func TestHandleListLinks_CascadeAfterDeleteFact(t *testing.T) {
-	s, factID, epID := seedLinkServer(t)
+func TestHandleEdgeList_UnknownMemoryID(t *testing.T) {
+	s, _, _ := seedKGServer(t)
 	ctx := context.Background()
 
-	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
-		t.Fatalf("handleLink: %v", err)
-	}
-
-	// Delete the fact directly — the link row should cascade away.
-	if err := s.store.DeleteFact(ctx, factID); err != nil {
-		t.Fatalf("DeleteFact: %v", err)
-	}
-
-	// Episode side should now report no links.
-	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: epID})
-	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
-	}
-	if len(out.Links) != 0 {
-		t.Errorf("links after cascade = %+v, want empty", out.Links)
+	_, _, err := s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: "no-such-id"})
+	if err == nil {
+		t.Error("expected error for unknown memory_id")
 	}
 }
 
-// TestWriteEpisodeWithLinkedFactIDs_StillWorks guards against regressions in the
-// episode-write path after the LinkFactEpisode signature change. Even though
-// InsertEpisode uses its own inline INSERT (not LinkFactEpisode), we verify
-// that EpisodePayload.LinkedFactIDs still establishes links observable via
-// memory_list_links.
+func TestHandleEntityUpsert_ExactDedup(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, first, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{
+		Name: "foo.go", EntityType: "file",
+	})
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if !first.Created {
+		t.Error("first Created = false, want true")
+	}
+	if first.MatchedBySimilarity {
+		t.Error("first MatchedBySimilarity = true, want false")
+	}
+
+	_, second, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{
+		Name: "foo.go", EntityType: "file",
+	})
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if second.Created {
+		t.Error("second Created = true, want false (dedup)")
+	}
+	if second.EntityID != first.EntityID {
+		t.Errorf("EntityID mismatch: %q vs %q", second.EntityID, first.EntityID)
+	}
+	if second.MatchedBySimilarity {
+		t.Error("second MatchedBySimilarity = true, want false (exact match)")
+	}
+}
+
+func TestHandleEntityUpsert_DifferentType(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, asFile, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{
+		Name: "foo", EntityType: "file",
+	})
+	if err != nil {
+		t.Fatalf("upsert as file: %v", err)
+	}
+	_, asConcept, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{
+		Name: "foo", EntityType: "concept",
+	})
+	if err != nil {
+		t.Fatalf("upsert as concept: %v", err)
+	}
+	if asFile.EntityID == asConcept.EntityID {
+		t.Errorf("same EntityID across entity_types: %q", asFile.EntityID)
+	}
+	if !asConcept.Created {
+		t.Error("expected Created=true for distinct entity_type")
+	}
+}
+
+func TestHandleEntityMention_HappyPath(t *testing.T) {
+	emb := newStubEmbedder(4)
+	// Distinct orthogonal vectors per entity so similarity dedup does NOT
+	// collapse them — the stub returns [1,0,0,0] for unknown strings, and
+	// UpsertEntity falls back to cosine dedup within the same entity_type.
+	emb.vectors["e1 (concept)"] = []float32{1, 0, 0, 0}
+	emb.vectors["e2 (concept)"] = []float32{0, 1, 0, 0}
+	emb.vectors["e3 (concept)"] = []float32{0, 0, 1, 0}
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, fOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("write fact: %v", err)
+	}
+	ids := make([]string, 3)
+	for i, name := range []string{"e1", "e2", "e3"} {
+		_, up, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: name, EntityType: "concept"})
+		if err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+		ids[i] = up.EntityID
+	}
+
+	_, out, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: fOut.ID, EntityIDs: ids,
+	})
+	if err != nil {
+		t.Fatalf("handleEntityMention: %v", err)
+	}
+	if out.Inserted != 3 {
+		t.Errorf("Inserted = %d, want 3", out.Inserted)
+	}
+}
+
+func TestHandleEntityMention_IdempotentRepeat(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, fOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("write fact: %v", err)
+	}
+	_, up, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "e1", EntityType: "concept"})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	_, first, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: fOut.ID, EntityIDs: []string{up.EntityID},
+	})
+	if err != nil {
+		t.Fatalf("first mention: %v", err)
+	}
+	if first.Inserted != 1 {
+		t.Errorf("first Inserted = %d, want 1", first.Inserted)
+	}
+
+	_, second, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: fOut.ID, EntityIDs: []string{up.EntityID},
+	})
+	if err != nil {
+		t.Fatalf("second mention: %v", err)
+	}
+	if second.Inserted != 0 {
+		t.Errorf("second Inserted = %d, want 0 (idempotent)", second.Inserted)
+	}
+}
+
+func TestHandleEntityMention_BadMemoryID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, up, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "e1", EntityType: "concept"})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// memory_id resolves to an entity, which is forbidden.
+	_, _, err = s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: up.EntityID, EntityIDs: []string{up.EntityID},
+	})
+	if err == nil {
+		t.Error("expected error when memory_id is an entity")
+	}
+}
+
+func TestHandleEntityNeighbors_OneHop(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["fact alpha"] = []float32{1, 0, 0, 0}
+	emb.vectors["fact beta"] = []float32{0, 1, 0, 0}
+	// Distinct embedding texts so entity similarity dedup does not
+	// collapse "primary" and "other" into a single row.
+	emb.vectors["primary (concept)"] = []float32{0, 0, 1, 0}
+	emb.vectors["other (concept)"] = []float32{0, 0, 0, 1}
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, fa, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact alpha", Type: "project"})
+	if err != nil {
+		t.Fatalf("write alpha: %v", err)
+	}
+	_, fb, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact beta", Type: "project"})
+	if err != nil {
+		t.Fatalf("write beta: %v", err)
+	}
+
+	_, primary, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "primary", EntityType: "concept"})
+	if err != nil {
+		t.Fatalf("upsert primary: %v", err)
+	}
+	_, other, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "other", EntityType: "concept"})
+	if err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+
+	// Two memory mentions of primary.
+	if _, _, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: fa.ID, EntityIDs: []string{primary.EntityID},
+	}); err != nil {
+		t.Fatalf("mention fa: %v", err)
+	}
+	if _, _, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID: fb.ID, EntityIDs: []string{primary.EntityID},
+	}); err != nil {
+		t.Fatalf("mention fb: %v", err)
+	}
+
+	// Entity-to-entity edge.
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{
+		SrcID: primary.EntityID, DstID: other.EntityID, EdgeType: "references",
+	}); err != nil {
+		t.Fatalf("add entity edge: %v", err)
+	}
+
+	_, out, err := s.handleEntityNeighbors(ctx, nil, EntityNeighborsInput{EntityID: primary.EntityID})
+	if err != nil {
+		t.Fatalf("handleEntityNeighbors: %v", err)
+	}
+	if len(out.Memories) != 2 {
+		t.Errorf("len(Memories) = %d, want 2 (%+v)", len(out.Memories), out.Memories)
+	}
+	if len(out.Entities) != 1 || out.Entities[0].ID != other.EntityID {
+		t.Errorf("Entities = %+v, want one neighbor %q", out.Entities, other.EntityID)
+	}
+}
+
+// TestWriteEpisodeWithLinkedFactIDs_StillWorks is the Phase-1-rewire canary at
+// the MCP layer: write a fact, write an episode with EpisodePayload.LinkedFactIDs,
+// then memory_get the episode and confirm the link survives. This guards the
+// rewire of writeEpisode/getEpisode from fact_episode_links onto memory_edges.
 func TestWriteEpisodeWithLinkedFactIDs_StillWorks(t *testing.T) {
 	emb := newStubEmbedder(4)
 	emb.vectors["fact x"] = []float32{0.5, 0.5, 0.0, 0.0}
@@ -5267,11 +5483,25 @@ func TestWriteEpisodeWithLinkedFactIDs_StillWorks(t *testing.T) {
 		t.Fatalf("handleWrite episode: %v", err)
 	}
 
-	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: eOut.ID})
+	// Drive through the MCP handler layer: memory_get on the episode must
+	// surface the linked fact in its Links slice.
+	_, eGet, err := s.handleGet(ctx, nil, GetInput{ID: eOut.ID})
 	if err != nil {
-		t.Fatalf("handleListLinks: %v", err)
+		t.Fatalf("handleGet episode: %v", err)
 	}
-	if len(out.Links) != 1 || out.Links[0].ID != fOut.ID {
-		t.Errorf("episode links = %+v, want one link to %s", out.Links, fOut.ID)
+	if len(eGet.Links) != 1 || eGet.Links[0].ID != fOut.ID {
+		t.Errorf("episode links = %+v, want one link to %s", eGet.Links, fOut.ID)
+	}
+
+	// Also confirm via the new memory_edge_list surface.
+	_, listOut, err := s.handleEdgeList(ctx, nil, EdgeListInput{MemoryID: eOut.ID})
+	if err != nil {
+		t.Fatalf("handleEdgeList: %v", err)
+	}
+	if len(listOut.Edges) != 1 || listOut.Edges[0].OtherID != fOut.ID {
+		t.Errorf("edge list = %+v, want one edge to %s", listOut.Edges, fOut.ID)
+	}
+	if listOut.Edges[0].EdgeType != "evidence" {
+		t.Errorf("EdgeType = %q, want evidence", listOut.Edges[0].EdgeType)
 	}
 }

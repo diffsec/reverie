@@ -246,44 +246,71 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 		},
 	}, s.handleUnsupersede)
 
+	// --- Phase 7 knowledge graph tools ---
+
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "memory_link",
-		Description: "Create a cross-type link between an L2 fact and an L3 episode. " +
-			"link_type defaults to \"evidence\"; any non-empty string is accepted. " +
-			"Idempotent: repeating the same link returns created=false. " +
-			"Both IDs must resolve to memories of the correct layer.",
+		Name:        "memory_edge_add",
+		Description: "Add a typed directed edge between two memories or entities.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			ReadOnlyHint:   readOnlyFalse,
 			IdempotentHint: true,
 			OpenWorldHint:  &openWorld,
-			Title:          "Link fact and episode",
+			Title:          "Add knowledge-graph edge",
 		},
-	}, s.handleLink)
+	}, s.handleEdgeAdd)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "memory_unlink",
-		Description: "Remove a cross-type link between an L2 fact and an L3 episode. " +
-			"Idempotent: returns deleted=false when no such link exists. " +
-			"Does not require the IDs to resolve to existing memories — an orphan link row can exist before cascade runs.",
+		Name:        "memory_edge_remove",
+		Description: "Remove a specific edge (idempotent on missing).",
 		Annotations: &mcpsdk.ToolAnnotations{
 			ReadOnlyHint:   readOnlyFalse,
 			IdempotentHint: true,
 			OpenWorldHint:  &openWorld,
-			Title:          "Unlink fact and episode",
+			Title:          "Remove knowledge-graph edge",
 		},
-	}, s.handleUnlink)
+	}, s.handleEdgeRemove)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name: "memory_list_links",
-		Description: "List all cross-type links for a given memory. Resolves memory_id as a fact first, then as an episode. " +
-			"Returns the OTHER side of each link with layer, link_type, and a 120-char content preview. " +
-			"Errors if the memory ID does not exist.",
+		Name:        "memory_edge_list",
+		Description: "List edges incident to a memory or entity, up to N hops (1-3).",
 		Annotations: &mcpsdk.ToolAnnotations{
 			ReadOnlyHint:  true,
 			OpenWorldHint: &openWorld,
-			Title:         "List memory links",
+			Title:         "List edges",
 		},
-	}, s.handleListLinks)
+	}, s.handleEdgeList)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "memory_entity_upsert",
+		Description: "Create or dedupe an entity by (name, entity_type), with similarity fallback.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Upsert entity",
+		},
+	}, s.handleEntityUpsert)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "memory_entity_mention",
+		Description: "Attach a memory to one or more entities (idempotent).",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Add entity mentions",
+		},
+	}, s.handleEntityMention)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "memory_entity_neighbors",
+		Description: "Walk the graph from an entity to nearby memories and entities.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: &openWorld,
+			Title:         "Entity neighbors",
+		},
+	}, s.handleEntityNeighbors)
 
 	// --- Phase 6c session tools ---
 

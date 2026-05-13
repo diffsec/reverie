@@ -104,6 +104,9 @@ type countStatus struct {
 	Facts    int `json:"facts"`
 	Episodes int `json:"episodes"`
 	Clusters int `json:"clusters"`
+	// Phase 7 additions: knowledge-graph node and edge counts.
+	Entities int `json:"entities"`
+	Edges    int `json:"edges"`
 }
 
 // retentionStatus summarises cluster retention across the store: how many
@@ -156,6 +159,18 @@ func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResou
 	clusters, err := s.store.ListClusters(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("status: list clusters: %w", err)
+	}
+
+	// Phase 7 graph counts — two cheap COUNT(*) queries. Fail-fast: a
+	// count failure is reported (these are tiny tables, so a real error
+	// indicates schema / connection trouble worth surfacing).
+	entityCount, err := s.store.CountEntities(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("status: count entities: %w", err)
+	}
+	edgeCount, err := s.store.CountEdges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("status: count edges: %w", err)
 	}
 
 	// --- Retention histogram over non-empty clusters. ---
@@ -257,6 +272,8 @@ func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResou
 			Facts:    len(facts),
 			Episodes: len(episodes),
 			Clusters: len(clusters),
+			Entities: entityCount,
+			Edges:    edgeCount,
 		},
 		Disabled:       s.cfg.Server.Disabled,
 		Retention:      retentionStatus{BelowThreshold: belowThreshold, Buckets: buckets},

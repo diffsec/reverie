@@ -779,20 +779,26 @@ func TestSessionEnd_WithEpisodePayload(t *testing.T) {
 		t.Errorf("episode tags %v should include %q", ep.Tags, expectTag)
 	}
 
-	// Auto-link: the buffered fact should be linked to the episode.
-	factLinks, err := s.store.GetEpisodeLinks(ctx, ep.ID)
+	// Auto-link: the buffered fact should be linked to the episode via an
+	// evidence edge in memory_edges (the Phase-7 successor of
+	// fact_episode_links). The episode is the destination (dst_id) of the
+	// fact->episode evidence edge written by ReplaceEpisodeLinks.
+	edges, err := s.store.ListEdges(ctx, ep.ID, 1)
 	if err != nil {
-		t.Fatalf("GetEpisodeLinks: %v", err)
+		t.Fatalf("ListEdges: %v", err)
 	}
 	foundLink := false
-	for _, l := range factLinks {
-		if l.FactID == writeOut.ID {
+	for _, e := range edges {
+		if e.Edge.EdgeType != "evidence" {
+			continue
+		}
+		if e.Edge.SrcID == writeOut.ID && e.Edge.DstID == ep.ID {
 			foundLink = true
 			break
 		}
 	}
 	if !foundLink {
-		t.Errorf("episode should be linked to buffered fact %s; got %+v", writeOut.ID, factLinks)
+		t.Errorf("episode should have evidence edge from buffered fact %s; got %+v", writeOut.ID, edges)
 	}
 }
 
@@ -861,5 +867,86 @@ func TestSessionEnd_SkipsDeletedMemoryIDs(t *testing.T) {
 	// Only the live fact's cluster should be counted.
 	if endOut.ClustersTicked != 1 {
 		t.Errorf("ClustersTicked = %d, want 1 (dead refs skipped)", endOut.ClustersTicked)
+	}
+}
+
+// TestHandleSessionEnd_TicksEntitiesFromBuffer is the Phase-7 plumbing
+// integration test: a buffered memory mentions an entity, the entity has
+// non-zero turns_since pre-session_end, and session_end's scoped tick
+// resets that entity's turns_since to 0 (and bumps an unrelated entity
+// to demonstrate that the access set really is scoped).
+func TestHandleSessionEnd_TicksEntitiesFromBuffer(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["buffered fact"] = []float32{1, 0, 0, 0}
+	emb.vectors["mentioned (file)"] = []float32{0, 1, 0, 0}
+	emb.vectors["other (file)"] = []float32{0, 0, 1, 0}
+	s, sessID := newSessionTestServer(t, emb, 0)
+
+	ctx := context.Background()
+
+	// Seed: one fact in the session buffer (via the write+session path),
+	// one mentioned entity, one unrelated entity.
+	_, writeOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content:   "buffered fact",
+		Type:      "project",
+		SessionID: sessID,
+	})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, entMentioned, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "mentioned", EntityType: "file"})
+	if err != nil {
+		t.Fatalf("upsert mentioned: %v", err)
+	}
+	_, entOther, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "other", EntityType: "file"})
+	if err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+	if _, _, err := s.handleEntityMention(ctx, nil, EntityMentionInput{
+		MemoryID:  writeOut.ID,
+		EntityIDs: []string{entMentioned.EntityID},
+	}); err != nil {
+		t.Fatalf("entity_mention: %v", err)
+	}
+
+	// Drive both entities forward by ticking decay a few times — the
+	// session-buffered memory's mentioned entity should reset on
+	// session_end while the unrelated one keeps aging.
+	for i := 0; i < 3; i++ {
+		if _, _, err := s.handleDecayTick(ctx, nil, DecayTickInput{}); err != nil {
+			t.Fatalf("decay_tick %d: %v", i, err)
+		}
+	}
+
+	preMentioned, err := s.store.GetEntity(ctx, entMentioned.EntityID)
+	if err != nil {
+		t.Fatalf("pre GetEntity mentioned: %v", err)
+	}
+	if preMentioned.TurnsSince == 0 {
+		t.Fatal("pre-condition: mentioned entity should have turns_since > 0 before session_end")
+	}
+
+	// End session — must reset the mentioned entity via the buffer →
+	// entity_mentions lookup.
+	_, _, err = s.handleSessionEnd(ctx, nil, SessionEndInput{SessionID: sessID})
+	if err != nil {
+		t.Fatalf("session_end: %v", err)
+	}
+
+	postMentioned, err := s.store.GetEntity(ctx, entMentioned.EntityID)
+	if err != nil {
+		t.Fatalf("post GetEntity mentioned: %v", err)
+	}
+	if postMentioned.TurnsSince != 0 {
+		t.Errorf("mentioned entity turns_since = %d, want 0 (should reset via buffer mention)", postMentioned.TurnsSince)
+	}
+
+	postOther, err := s.store.GetEntity(ctx, entOther.EntityID)
+	if err != nil {
+		t.Fatalf("post GetEntity other: %v", err)
+	}
+	// The session-end tick bumps the unrelated entity by 1.
+	if postOther.TurnsSince <= preMentioned.TurnsSince {
+		t.Errorf("unrelated entity turns_since = %d, want > %d (should keep aging)", postOther.TurnsSince, preMentioned.TurnsSince)
 	}
 }

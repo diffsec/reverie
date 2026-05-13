@@ -5,18 +5,45 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"personal/reverie/pkg/ebbinghaus"
 	"personal/reverie/pkg/vecmath"
 )
 
-// linkRow represents a row in the fact_episode_links table for the in-memory store.
-type linkRow struct {
-	FactID    string
-	EpisodeID string
-	LinkType  string
+// edgeRow is the in-memory mirror of a memory_edges row.
+type edgeRow struct {
+	SrcID     string
+	DstID     string
+	EdgeType  string
+	Weight    float64
+	CreatedAt time.Time
+}
+
+// entityRow is the in-memory mirror of an entities row.
+type entityRow struct {
+	ID         string
+	Name       string
+	EntityType string
+	Embedding  []float32
+	Utility    float64
+	Frequency  float64
+	TurnsSince int
+	Retention  float64
+	LastAccess time.Time
+	CreatedAt  time.Time
+}
+
+// mentionRow is the in-memory mirror of an entity_mentions row. Role is
+// stored verbatim; an empty string is the in-memory equivalent of a SQL
+// NULL role.
+type mentionRow struct {
+	MemoryID string
+	EntityID string
+	Role     string
 }
 
 // memStore is an in-memory Store for use in unit tests of packages that depend
@@ -30,8 +57,13 @@ type memStore struct {
 	order        []string
 	episodes     map[string]Episode
 	episodeOrder []string
-	links        []linkRow
-	clusters     map[string]ClusterNode
+	// Phase 7 knowledge-graph slices replace the old fact_episode_links
+	// store. edges holds memory_edges rows; entities holds first-class
+	// entity nodes; mentions holds memory->entity references.
+	edges    []edgeRow
+	entities []entityRow
+	mentions []mentionRow
+	clusters map[string]ClusterNode
 	// lastTick mirrors the sqlite decay_state.last_tick singleton. Zero value
 	// = never ticked.
 	lastTick time.Time
@@ -136,31 +168,35 @@ func (m *memStore) DeleteFact(_ context.Context, id string) error {
 			break
 		}
 	}
-	// Cascade-delete links.
-	m.deleteLinksByFact(id)
+	// Cascade memory_edges (either direction) and entity_mentions for this
+	// memory id. Entities themselves are not cascade-deleted.
+	m.cascadeDeleteMemory(id)
 	return nil
 }
 
-// deleteLinksByFact removes all link rows referencing the given fact. Must be called with mu held.
-func (m *memStore) deleteLinksByFact(factID string) {
-	filtered := m.links[:0]
-	for _, l := range m.links {
-		if l.FactID != factID {
-			filtered = append(filtered, l)
+// cascadeDeleteMemory removes any memory_edges row touching id (src or
+// dst) and any entity_mentions row whose memory_id matches id. Must be
+// called with m.mu held. Entities themselves are intentionally untouched
+// (multi-memory references are common; orphaned entities fade through
+// decay).
+func (m *memStore) cascadeDeleteMemory(id string) {
+	keptEdges := m.edges[:0]
+	for _, e := range m.edges {
+		if e.SrcID == id || e.DstID == id {
+			continue
 		}
+		keptEdges = append(keptEdges, e)
 	}
-	m.links = filtered
-}
+	m.edges = keptEdges
 
-// deleteLinksByEpisode removes all link rows referencing the given episode. Must be called with mu held.
-func (m *memStore) deleteLinksByEpisode(episodeID string) {
-	filtered := m.links[:0]
-	for _, l := range m.links {
-		if l.EpisodeID != episodeID {
-			filtered = append(filtered, l)
+	keptMentions := m.mentions[:0]
+	for _, mn := range m.mentions {
+		if mn.MemoryID == id {
+			continue
 		}
+		keptMentions = append(keptMentions, mn)
 	}
-	m.links = filtered
+	m.mentions = keptMentions
 }
 
 func (m *memStore) ListFacts(_ context.Context, filter ListFilter) ([]Fact, error) {
@@ -412,12 +448,33 @@ func (m *memStore) InsertEpisode(_ context.Context, e Episode) (string, error) {
 	m.episodes[e.ID] = e
 	m.episodeOrder = append(m.episodeOrder, e.ID)
 
-	// Insert cross-links for any linked fact IDs.
+	// Insert evidence edges for any linked fact IDs. Direction is pinned:
+	// src=fact, dst=episode, edge_type='evidence'. Mirrors the sqlite
+	// store's writeEpisode rewire.
+	now2 := time.Now().UTC()
 	for _, factID := range e.LinkedFactIDs {
-		m.addLink(factID, e.ID, "evidence")
+		m.addEdgeIfAbsent(edgeRow{
+			SrcID:     factID,
+			DstID:     e.ID,
+			EdgeType:  "evidence",
+			Weight:    1.0,
+			CreatedAt: now2,
+		})
 	}
 
 	return e.ID, nil
+}
+
+// addEdgeIfAbsent inserts an edge unless one with the same
+// (src,dst,type) tuple already exists. Must be called with m.mu held.
+func (m *memStore) addEdgeIfAbsent(e edgeRow) bool {
+	for _, existing := range m.edges {
+		if existing.SrcID == e.SrcID && existing.DstID == e.DstID && existing.EdgeType == e.EdgeType {
+			return false
+		}
+	}
+	m.edges = append(m.edges, e)
+	return true
 }
 
 func (m *memStore) GetEpisode(_ context.Context, id string) (*Episode, error) {
@@ -429,11 +486,13 @@ func (m *memStore) GetEpisode(_ context.Context, id string) (*Episode, error) {
 		return nil, nil
 	}
 
-	// Load linked fact IDs.
+	// Load linked fact IDs from the edges slice. Direction matches the
+	// InsertEpisode write path: src=factID, dst=episodeID,
+	// edge_type='evidence'.
 	ep.LinkedFactIDs = nil
-	for _, l := range m.links {
-		if l.EpisodeID == id {
-			ep.LinkedFactIDs = append(ep.LinkedFactIDs, l.FactID)
+	for _, edge := range m.edges {
+		if edge.DstID == id && edge.EdgeType == "evidence" {
+			ep.LinkedFactIDs = append(ep.LinkedFactIDs, edge.SrcID)
 		}
 	}
 
@@ -455,8 +514,8 @@ func (m *memStore) DeleteEpisode(_ context.Context, id string) error {
 			break
 		}
 	}
-	// Cascade-delete links.
-	m.deleteLinksByEpisode(id)
+	// Cascade memory_edges + entity_mentions, same rules as DeleteFact.
+	m.cascadeDeleteMemory(id)
 	return nil
 }
 
@@ -611,95 +670,442 @@ func (m *memStore) CountEpisodesByCluster(_ context.Context, clusterID string) (
 	return n, nil
 }
 
-// --- Fact <-> Episode cross-type links ---
+// --- Knowledge graph (Phase 7) ---
+//
+// In-memory mirror of the sqliteStore KG surface. The slices (edges,
+// entities, mentions) live on memStore; helpers operate under m.mu.
 
-// addLink adds a link row. Must be called with mu held.
-func (m *memStore) addLink(factID, episodeID, linkType string) {
-	// Dedup.
-	for _, l := range m.links {
-		if l.FactID == factID && l.EpisodeID == episodeID {
-			return
-		}
-	}
-	m.links = append(m.links, linkRow{
-		FactID:    factID,
-		EpisodeID: episodeID,
-		LinkType:  linkType,
-	})
-}
-
-func (m *memStore) LinkFactEpisode(_ context.Context, factID, episodeID, linkType string) (bool, error) {
-	if linkType == "" {
-		linkType = "evidence"
+// AddEdge inserts a typed directed edge. Idempotent by
+// (src,dst,edge_type) — duplicate returns created=false with the
+// existing weight untouched.
+func (m *memStore) AddEdge(_ context.Context, e Edge) (bool, error) {
+	if e.Weight == 0 {
+		e.Weight = 1.0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Check for an existing link; if present, this is a no-op.
-	for _, l := range m.links {
-		if l.FactID == factID && l.EpisodeID == episodeID {
-			return false, nil
-		}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
 	}
-	m.links = append(m.links, linkRow{
-		FactID:    factID,
-		EpisodeID: episodeID,
-		LinkType:  linkType,
-	})
-	return true, nil
+	return m.addEdgeIfAbsent(edgeRow{
+		SrcID:     e.SrcID,
+		DstID:     e.DstID,
+		EdgeType:  e.EdgeType,
+		Weight:    e.Weight,
+		CreatedAt: e.CreatedAt,
+	}), nil
 }
 
-func (m *memStore) UnlinkFactEpisode(_ context.Context, factID, episodeID string) (bool, error) {
+// RemoveEdge deletes the edge matching (src,dst,edge_type). Missing
+// edges return deleted=false (idempotent).
+func (m *memStore) RemoveEdge(_ context.Context, srcID, dstID, edgeType string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for i, l := range m.links {
-		if l.FactID == factID && l.EpisodeID == episodeID {
-			m.links = append(m.links[:i], m.links[i+1:]...)
+	for i, e := range m.edges {
+		if e.SrcID == srcID && e.DstID == dstID && e.EdgeType == edgeType {
+			m.edges = append(m.edges[:i], m.edges[i+1:]...)
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (m *memStore) GetFactLinks(_ context.Context, factID string) ([]EpisodeLink, error) {
+// ListEdges performs an in-memory BFS up to hops levels deep starting
+// from memoryID. hops is clamped to [1,3] silently (the tool surface
+// validates earlier). Each edge contributes one EdgeWithDistance at the
+// depth its non-seed endpoint was first reached.
+func (m *memStore) ListEdges(_ context.Context, memoryID string, hops int) ([]EdgeWithDistance, error) {
+	if hops < 1 {
+		hops = 1
+	}
+	if hops > 3 {
+		hops = 3
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var links []EpisodeLink
-	for _, l := range m.links {
-		if l.FactID == factID {
-			link := EpisodeLink{
-				EpisodeID: l.EpisodeID,
-				LinkType:  l.LinkType,
-			}
-			if ep, ok := m.episodes[l.EpisodeID]; ok {
-				epc := ep
-				link.Episode = &epc
-			}
-			links = append(links, link)
+	visited := map[string]struct{}{memoryID: {}}
+	frontier := map[string]struct{}{memoryID: {}}
+	var results []EdgeWithDistance
+
+	for depth := 1; depth <= hops; depth++ {
+		if len(frontier) == 0 {
+			break
 		}
+		nextFrontier := map[string]struct{}{}
+		for _, e := range m.edges {
+			_, srcIn := frontier[e.SrcID]
+			_, dstIn := frontier[e.DstID]
+			if !srcIn && !dstIn {
+				continue
+			}
+			var other string
+			if srcIn {
+				other = e.DstID
+			} else {
+				other = e.SrcID
+			}
+			if _, seen := visited[other]; seen {
+				continue
+			}
+			visited[other] = struct{}{}
+			nextFrontier[other] = struct{}{}
+			results = append(results, EdgeWithDistance{
+				Edge: Edge{
+					SrcID:     e.SrcID,
+					DstID:     e.DstID,
+					EdgeType:  e.EdgeType,
+					Weight:    e.Weight,
+					CreatedAt: e.CreatedAt,
+				},
+				Distance: depth,
+			})
+		}
+		frontier = nextFrontier
 	}
-	return links, nil
+	return results, nil
 }
 
-func (m *memStore) GetEpisodeLinks(_ context.Context, episodeID string) ([]FactLink, error) {
+// UpsertEntity dedups exact then by cosine similarity within the same
+// entity_type, mirroring the sqliteStore semantics. The caller-supplied
+// embedding is stored verbatim.
+func (m *memStore) UpsertEntity(_ context.Context, name, entityType string, embedding []float32) (string, bool, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Exact dedup.
+	for _, ent := range m.entities {
+		if ent.Name == name && ent.EntityType == entityType {
+			return ent.ID, false, false, nil
+		}
+	}
+
+	// Similarity dedup within the same entity_type.
+	if len(embedding) > 0 {
+		var bestID string
+		var bestSim float32
+		for _, ent := range m.entities {
+			if ent.EntityType != entityType {
+				continue
+			}
+			if len(ent.Embedding) == 0 {
+				continue
+			}
+			sim := vecmath.Cosine(embedding, ent.Embedding)
+			if sim > bestSim {
+				bestSim = sim
+				bestID = ent.ID
+			}
+		}
+		if bestID != "" && float64(bestSim) >= defaultEntitySimilarityThreshold {
+			return bestID, false, true, nil
+		}
+	}
+
+	id := uuid.New().String()
+	now := time.Now().UTC()
+	m.entities = append(m.entities, entityRow{
+		ID:         id,
+		Name:       name,
+		EntityType: entityType,
+		Embedding:  embedding,
+		Utility:    0.5,
+		Frequency:  0.5,
+		TurnsSince: 0,
+		Retention:  1.0,
+		CreatedAt:  now,
+		// LastAccess intentionally zero — entity has never been
+		// accessed yet; sqlite stores NULL.
+	})
+	return id, true, false, nil
+}
+
+// GetEntity returns the entity with the given id, or zero-value Entity
+// if not found (matches GetFact/GetEpisode's not-found convention).
+func (m *memStore) GetEntity(_ context.Context, id string) (Entity, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, ent := range m.entities {
+		if ent.ID == id {
+			return entityRowToEntity(ent), nil
+		}
+	}
+	return Entity{}, nil
+}
+
+// entityRowToEntity copies the in-memory row into the exported Entity
+// struct.
+func entityRowToEntity(r entityRow) Entity {
+	return Entity{
+		ID:         r.ID,
+		Name:       r.Name,
+		EntityType: r.EntityType,
+		Embedding:  r.Embedding,
+		Utility:    r.Utility,
+		Frequency:  r.Frequency,
+		TurnsSince: r.TurnsSince,
+		Retention:  r.Retention,
+		LastAccess: r.LastAccess,
+		CreatedAt:  r.CreatedAt,
+	}
+}
+
+// FindSimilarEntities returns entities (optionally filtered by type) whose
+// embedding has cosine similarity >= threshold to the query vector. Sorted
+// descending by similarity, capped at limit.
+func (m *memStore) FindSimilarEntities(_ context.Context, embedding []float32, entityType string, threshold float64, limit int) ([]EntityWithScore, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var scored []EntityWithScore
+	for _, ent := range m.entities {
+		if entityType != "" && ent.EntityType != entityType {
+			continue
+		}
+		if len(ent.Embedding) == 0 {
+			continue
+		}
+		sim := vecmath.Cosine(embedding, ent.Embedding)
+		if float64(sim) >= threshold {
+			scored = append(scored, EntityWithScore{
+				Entity:     entityRowToEntity(ent),
+				Similarity: sim,
+			})
+		}
+	}
+	sort.Slice(scored, func(i, j int) bool { return scored[i].Similarity > scored[j].Similarity })
+	if limit > 0 && len(scored) > limit {
+		scored = scored[:limit]
+	}
+	return scored, nil
+}
+
+// TickAllEntities increments turns_since for every entity, resets
+// accessed entities to (turns_since=0, retention=1.0, last_access=now),
+// then recomputes retention for every row via the pure formula in
+// pkg/ebbinghaus. Same shape as TickAllClusters.
+func (m *memStore) TickAllEntities(_ context.Context, accessedIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	accessedSet := make(map[string]struct{}, len(accessedIDs))
+	for _, id := range accessedIDs {
+		accessedSet[id] = struct{}{}
+	}
+	now := time.Now().UTC()
+	for i := range m.entities {
+		m.entities[i].TurnsSince++
+		if _, ok := accessedSet[m.entities[i].ID]; ok {
+			m.entities[i].TurnsSince = 0
+			m.entities[i].LastAccess = now
+		}
+		m.entities[i].Retention = ebbinghaus.Retention(
+			m.entities[i].TurnsSince,
+			m.entities[i].Utility,
+			m.entities[i].Frequency,
+			ebbinghaus.DefaultTemperature,
+		)
+	}
+	return nil
+}
+
+// AddEntityMentions inserts (memory_id, entity_id) rows for every entity
+// in entityIDs. Idempotent by (memory_id, entity_id); duplicates return
+// inserted=0 for that entity.
+func (m *memStore) AddEntityMentions(_ context.Context, memoryID string, entityIDs []string, role string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inserted := 0
+outer:
+	for _, eid := range entityIDs {
+		for _, existing := range m.mentions {
+			if existing.MemoryID == memoryID && existing.EntityID == eid {
+				continue outer
+			}
+		}
+		m.mentions = append(m.mentions, mentionRow{
+			MemoryID: memoryID,
+			EntityID: eid,
+			Role:     role,
+		})
+		inserted++
+	}
+	return inserted, nil
+}
+
+// ListMemoriesByEntity returns memories mentioning the given entity. Each
+// MemoryRef's Layer/Content is resolved against the facts and episodes
+// maps; orphaned mentions whose memory id no longer exists are dropped.
+func (m *memStore) ListMemoriesByEntity(_ context.Context, entityID string, limit int) ([]MemoryRef, error) {
+	if limit <= 0 {
+		limit = 25
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var links []FactLink
-	for _, l := range m.links {
-		if l.EpisodeID == episodeID {
-			link := FactLink{
-				FactID:   l.FactID,
-				LinkType: l.LinkType,
-			}
-			if f, ok := m.facts[l.FactID]; ok {
-				fc := f
-				link.Fact = &fc
-			}
-			links = append(links, link)
+	refs := []MemoryRef{}
+	for _, mn := range m.mentions {
+		if mn.EntityID != entityID {
+			continue
+		}
+		ref, ok := m.resolveMemoryRef(mn.MemoryID)
+		if !ok {
+			continue
+		}
+		refs = append(refs, ref)
+		if len(refs) >= limit {
+			break
 		}
 	}
-	return links, nil
+	return refs, nil
+}
+
+// resolveMemoryRef returns a populated MemoryRef on hit. Must be called
+// with m.mu held (read or write).
+func (m *memStore) resolveMemoryRef(id string) (MemoryRef, bool) {
+	if f, ok := m.facts[id]; ok {
+		return MemoryRef{ID: id, Layer: TypeL2Semantic, Content: truncatePreview(f.Content)}, true
+	}
+	if ep, ok := m.episodes[id]; ok {
+		preview := strings.TrimSpace(ep.Situation + " " + ep.Action + " " + ep.Outcome + " " + ep.Preemptive)
+		return MemoryRef{ID: id, Layer: TypeL3Episodic, Content: truncatePreview(preview)}, true
+	}
+	return MemoryRef{}, false
+}
+
+// ListEntityNeighbors walks out from the seed entity. Memories with
+// direct mentions of the seed are Distance=1; memory_edges contribute
+// further reach up to hops levels deep.
+func (m *memStore) ListEntityNeighbors(ctx context.Context, entityID string, hops int) ([]NeighborMemory, []NeighborEntity, error) {
+	if hops < 1 {
+		hops = 1
+	}
+	if hops > 3 {
+		hops = 3
+	}
+
+	var memories []NeighborMemory
+	var entities []NeighborEntity
+	seenMem := map[string]struct{}{}
+
+	m.mu.RLock()
+	// Distance-1 memories from mentions on the seed.
+	for _, mn := range m.mentions {
+		if mn.EntityID != entityID {
+			continue
+		}
+		ref, ok := m.resolveMemoryRef(mn.MemoryID)
+		if !ok {
+			continue
+		}
+		if _, dup := seenMem[mn.MemoryID]; dup {
+			continue
+		}
+		seenMem[mn.MemoryID] = struct{}{}
+		memories = append(memories, NeighborMemory{
+			ID:             mn.MemoryID,
+			Layer:          ref.Layer,
+			ContentPreview: ref.Content,
+			Distance:       1,
+		})
+	}
+	// Snapshot the data needed for the edge walk while the read lock is
+	// held; ListEdges takes the same lock so we release it first.
+	entityIndex := make(map[string]entityRow, len(m.entities))
+	for _, ent := range m.entities {
+		entityIndex[ent.ID] = ent
+	}
+	m.mu.RUnlock()
+
+	edges, err := m.ListEdges(ctx, entityID, hops)
+	if err != nil {
+		return nil, nil, err
+	}
+	seenEnt := map[string]struct{}{entityID: {}}
+	for _, ewd := range edges {
+		// Determine the "other" endpoint.
+		var other string
+		if _, ok := seenEnt[ewd.Edge.SrcID]; ok {
+			other = ewd.Edge.DstID
+		} else if _, ok := seenEnt[ewd.Edge.DstID]; ok {
+			other = ewd.Edge.SrcID
+		} else if _, isEnt := entityIndex[ewd.Edge.SrcID]; isEnt {
+			other = ewd.Edge.DstID
+		} else {
+			other = ewd.Edge.SrcID
+		}
+		seenEnt[other] = struct{}{}
+
+		if ent, ok := entityIndex[other]; ok {
+			entities = append(entities, NeighborEntity{
+				ID:         ent.ID,
+				Name:       ent.Name,
+				EntityType: ent.EntityType,
+				Distance:   ewd.Distance,
+			})
+			continue
+		}
+		m.mu.RLock()
+		ref, ok := m.resolveMemoryRef(other)
+		m.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if _, dup := seenMem[other]; dup {
+			continue
+		}
+		seenMem[other] = struct{}{}
+		memories = append(memories, NeighborMemory{
+			ID:             other,
+			Layer:          ref.Layer,
+			ContentPreview: ref.Content,
+			Distance:       ewd.Distance,
+		})
+	}
+	return memories, entities, nil
+}
+
+// ListEntitiesByMemoryIDs returns the deduped set of entity IDs mentioned
+// by any of the supplied memory IDs. Empty/nil input yields an empty
+// (non-nil) slice with no error. Implementation is a single linear pass
+// over m.mentions plus a set lookup — fine for test-scale stores.
+func (m *memStore) ListEntitiesByMemoryIDs(_ context.Context, memoryIDs []string) ([]string, error) {
+	if len(memoryIDs) == 0 {
+		return []string{}, nil
+	}
+	wanted := make(map[string]struct{}, len(memoryIDs))
+	for _, id := range memoryIDs {
+		wanted[id] = struct{}{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, mn := range m.mentions {
+		if _, ok := wanted[mn.MemoryID]; !ok {
+			continue
+		}
+		if _, dup := seen[mn.EntityID]; dup {
+			continue
+		}
+		seen[mn.EntityID] = struct{}{}
+		out = append(out, mn.EntityID)
+	}
+	return out, nil
+}
+
+// CountEntities returns the total number of entities. Mirrors the
+// sqliteStore counter; used by reverie://status.
+func (m *memStore) CountEntities(_ context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.entities), nil
+}
+
+// CountEdges returns the total number of memory_edges rows.
+func (m *memStore) CountEdges(_ context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.edges), nil
 }
 
 // --- Cluster operations (Phase 3 additions) ---
@@ -920,16 +1326,31 @@ func (m *memStore) UpdateEpisodeContent(_ context.Context, id string, e Episode)
 	return nil
 }
 
-// ReplaceEpisodeLinks clears and re-populates the link set for a given
-// episode. nil and empty slices both clear all links; callers that want to
+// ReplaceEpisodeLinks clears the evidence edges (src=*, dst=episodeID,
+// type='evidence') and reinstalls one row per supplied factID. nil and
+// empty slices both clear all evidence edges; callers that want to
 // preserve existing links must not call this method.
 func (m *memStore) ReplaceEpisodeLinks(_ context.Context, episodeID string, factIDs []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.deleteLinksByEpisode(episodeID)
+	keep := m.edges[:0]
+	for _, e := range m.edges {
+		if e.DstID == episodeID && e.EdgeType == "evidence" {
+			continue
+		}
+		keep = append(keep, e)
+	}
+	m.edges = keep
+	now := time.Now().UTC()
 	for _, factID := range factIDs {
-		m.addLink(factID, episodeID, "evidence")
+		m.addEdgeIfAbsent(edgeRow{
+			SrcID:     factID,
+			DstID:     episodeID,
+			EdgeType:  "evidence",
+			Weight:    1.0,
+			CreatedAt: now,
+		})
 	}
 	return nil
 }

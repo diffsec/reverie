@@ -23,7 +23,9 @@ type Store interface {
 	GetFact(ctx context.Context, id string) (*Fact, error)
 
 	// DeleteFact removes a fact by ID. Returns no error if the fact does not
-	// exist (idempotent delete).
+	// exist (idempotent delete). Associated rows in memory_edges (either
+	// direction) and entity_mentions are cascade-deleted by the store
+	// (the schema has no FKs on the polymorphic ID columns).
 	DeleteFact(ctx context.Context, id string) error
 
 	// ListFacts returns facts matching the given filter criteria, ordered by
@@ -42,8 +44,9 @@ type Store interface {
 	GetEpisode(ctx context.Context, id string) (*Episode, error)
 
 	// DeleteEpisode removes an episode by ID. Returns no error if the episode
-	// does not exist (idempotent delete). Associated fact_episode_links are
-	// cascade-deleted.
+	// does not exist (idempotent delete). Associated rows in memory_edges
+	// (either direction) and entity_mentions are cascade-deleted by the
+	// store (the schema has no FKs on the polymorphic ID columns).
 	DeleteEpisode(ctx context.Context, id string) error
 
 	// ListEpisodes returns episodes matching the given filter criteria, ordered
@@ -69,26 +72,91 @@ type Store interface {
 	// cluster (used for paginated membership responses).
 	CountEpisodesByCluster(ctx context.Context, clusterID string) (int, error)
 
-	// --- Fact <-> Episode cross-type links ---
+	// --- Knowledge graph (Phase 7) ---
+	//
+	// memory_edges/entities/entity_mentions are polymorphic on ID — there
+	// are no FKs in the schema. Layer membership for a given ID is decided
+	// by the application (fact-table lookup → episode-table lookup →
+	// entity-table lookup). Cascade-on-delete for facts/episodes is the
+	// store's responsibility (the FK-driven cascade that existed on the
+	// retired fact_episode_links is no longer available).
 
-	// LinkFactEpisode creates a link between a fact and an episode with the given
-	// link type (e.g. "evidence"). Duplicate links are silently ignored.
-	// Returns created=true when a new row was inserted, created=false when the
-	// link already existed (idempotent no-op).
-	LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) (created bool, err error)
+	// AddEdge inserts a typed directed edge between two memory or entity
+	// IDs. Idempotency is keyed by (src_id, dst_id, edge_type) — a repeat
+	// call returns created=false and does NOT overwrite the existing
+	// weight (caller policy from the design doc).
+	AddEdge(ctx context.Context, e Edge) (created bool, err error)
 
-	// UnlinkFactEpisode removes the link between a fact and an episode.
-	// Returns deleted=true when a row was removed, deleted=false when no such
-	// link existed (idempotent).
-	UnlinkFactEpisode(ctx context.Context, factID, episodeID string) (deleted bool, err error)
+	// RemoveEdge deletes the (src_id, dst_id, edge_type) row. Missing
+	// rows return deleted=false with no error (idempotent).
+	RemoveEdge(ctx context.Context, srcID, dstID, edgeType string) (deleted bool, err error)
 
-	// GetFactLinks returns the episodes linked to the given fact, eager-loaded
-	// via a single JOIN query.
-	GetFactLinks(ctx context.Context, factID string) ([]EpisodeLink, error)
+	// ListEdges performs a Go-side BFS starting at memoryID and walking
+	// memory_edges to a depth of `hops`. Each edge contributes exactly one
+	// EdgeWithDistance entry at the depth its non-seed endpoint was first
+	// reached. hops is clamped to [1,3] internally as a defense-in-depth
+	// guard against an unchecked caller; the public tool surface also
+	// validates.
+	ListEdges(ctx context.Context, memoryID string, hops int) ([]EdgeWithDistance, error)
 
-	// GetEpisodeLinks returns the facts linked to the given episode, eager-loaded
-	// via a single JOIN query.
-	GetEpisodeLinks(ctx context.Context, episodeID string) ([]FactLink, error)
+	// UpsertEntity dedups by (name, entity_type) exact match first, then
+	// falls back to cosine-similarity dedup within the same entity_type
+	// using FindSimilarEntities. The caller-supplied embedding must
+	// already be populated (it is the embedding of
+	// `name + " (" + entity_type + ")"` per the design doc's locked
+	// decision); the store does not call the embedder.
+	UpsertEntity(ctx context.Context, name, entityType string, embedding []float32) (id string, created bool, matchedBySimilarity bool, err error)
+
+	// GetEntity returns the entity with the given ID, or (zero Entity,
+	// nil) if no row exists. The zero-value-as-not-found convention
+	// matches GetFact/GetEpisode which return (nil, nil).
+	GetEntity(ctx context.Context, id string) (Entity, error)
+
+	// FindSimilarEntities returns entities of the given entity_type whose
+	// embedding has cosine similarity >= threshold to the query vector,
+	// ordered by descending similarity and capped at limit. Mirrors
+	// FindSimilarFacts but filters on entity_type (a per-type bucket)
+	// rather than fact subtype.
+	FindSimilarEntities(ctx context.Context, embedding []float32, entityType string, threshold float64, limit int) ([]EntityWithScore, error)
+
+	// TickAllEntities increments turns_since by 1 for all entities, resets
+	// turns_since=0 and bumps last_access for the entities named in
+	// accessedIDs, and recomputes the per-row retention column using the
+	// Ebbinghaus formula. Single transaction for the SQLite store.
+	TickAllEntities(ctx context.Context, accessedIDs []string) error
+
+	// AddEntityMentions inserts one row per entity in entityIDs linking
+	// memoryID to that entity with the given role. Idempotency is keyed
+	// by (memory_id, entity_id); duplicate rows are silently skipped. The
+	// returned inserted count reflects the number of NEW rows.
+	AddEntityMentions(ctx context.Context, memoryID string, entityIDs []string, role string) (inserted int, err error)
+
+	// ListMemoriesByEntity returns the memories (facts or episodes) that
+	// mention the given entity, capped at limit. Each returned MemoryRef
+	// has its Layer field populated by looking up the ID in the fact and
+	// episode tables.
+	ListMemoriesByEntity(ctx context.Context, entityID string, limit int) ([]MemoryRef, error)
+
+	// ListEntityNeighbors walks the graph out from an entity to `hops`
+	// hops. Memories are populated from entity_mentions on every entity
+	// reached during the walk (including the seed). Entities come from
+	// memory_edges rows where both endpoints resolve to entities.
+	ListEntityNeighbors(ctx context.Context, entityID string, hops int) (memories []NeighborMemory, entities []NeighborEntity, err error)
+
+	// ListEntitiesByMemoryIDs returns the deduped set of entity IDs
+	// mentioned by any of the supplied memory IDs. The session-end path
+	// uses this to translate buffered memory IDs into the access set for
+	// TickAllEntities. An empty/nil input slice returns an empty,
+	// non-nil slice with no error.
+	ListEntitiesByMemoryIDs(ctx context.Context, memoryIDs []string) ([]string, error)
+
+	// CountEntities returns the total number of rows in the entities
+	// table. Used by reverie://status to surface graph size at a glance.
+	CountEntities(ctx context.Context) (int, error)
+
+	// CountEdges returns the total number of rows in the memory_edges
+	// table. Used by reverie://status alongside CountEntities.
+	CountEdges(ctx context.Context) (int, error)
 
 	// --- Search ---
 
@@ -190,11 +258,13 @@ type Store interface {
 	// normalize e.Tags via normalizeTags before writing.
 	UpdateEpisodeContent(ctx context.Context, id string, e Episode) error
 
-	// ReplaceEpisodeLinks deletes all fact_episode_links for the given
-	// episode and then inserts one row per factID. Callers pass an empty
-	// slice to clear links; nil is treated the same as empty (no rows).
-	// The handler is responsible for the "nil means preserve" convention —
-	// it should not call this method at all when no link change is wanted.
+	// ReplaceEpisodeLinks deletes all evidence-edges (memory_edges rows
+	// with dst_id=episodeID, edge_type='evidence') and then inserts one
+	// row per factID as (src_id=factID, dst_id=episodeID,
+	// edge_type='evidence'). Callers pass an empty slice to clear links;
+	// nil is treated the same as empty (no rows). The handler is
+	// responsible for the "nil means preserve" convention — it should not
+	// call this method at all when no link change is wanted.
 	ReplaceEpisodeLinks(ctx context.Context, episodeID string, factIDs []string) error
 
 	// --- Temporal conflict resolution ---

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"personal/reverie/internal/memory"
+	"personal/reverie/pkg/ebbinghaus"
 )
 
 func TestNewDecayer(t *testing.T) {
@@ -20,15 +21,15 @@ func TestNewDecayer(t *testing.T) {
 
 	t.Run("zero temperature falls back to default", func(t *testing.T) {
 		d := NewDecayer(0, 0.3)
-		if d.Temperature() != DefaultTemperature {
-			t.Errorf("Temperature() = %g, want %g (DefaultTemperature)", d.Temperature(), DefaultTemperature)
+		if d.Temperature() != ebbinghaus.DefaultTemperature {
+			t.Errorf("Temperature() = %g, want %g (ebbinghaus.DefaultTemperature)", d.Temperature(), ebbinghaus.DefaultTemperature)
 		}
 	})
 
 	t.Run("negative temperature falls back to default", func(t *testing.T) {
 		d := NewDecayer(-5.0, 0.3)
-		if d.Temperature() != DefaultTemperature {
-			t.Errorf("Temperature() = %g, want %g (DefaultTemperature)", d.Temperature(), DefaultTemperature)
+		if d.Temperature() != ebbinghaus.DefaultTemperature {
+			t.Errorf("Temperature() = %g, want %g (ebbinghaus.DefaultTemperature)", d.Temperature(), ebbinghaus.DefaultTemperature)
 		}
 	})
 }
@@ -70,7 +71,7 @@ func TestDecayerRetention(t *testing.T) {
 				Utility:    0.8,
 				Frequency:  0.3,
 			},
-			wantApprox: Retention(20, 0.8, 0.3, 10.0),
+			wantApprox: ebbinghaus.Retention(20, 0.8, 0.3, 10.0),
 			tolerance:  1e-15,
 		},
 	}
@@ -83,6 +84,37 @@ func TestDecayerRetention(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecayer_RetentionFromState(t *testing.T) {
+	d := NewDecayer(10.0, 0.3)
+
+	t.Run("zero turns_since yields full retention", func(t *testing.T) {
+		got := d.RetentionFromState(0.5, 0.5, 0)
+		if math.Abs(got-1.0) > 1e-12 {
+			t.Errorf("RetentionFromState(0.5, 0.5, 0) = %g, want 1.0", got)
+		}
+	})
+
+	t.Run("strictly decreasing as turnsSince grows", func(t *testing.T) {
+		prev := math.Inf(1)
+		for n := 0; n <= 25; n++ {
+			cur := d.RetentionFromState(0.4, 0.6, n)
+			if n > 0 && cur >= prev {
+				t.Errorf("retention not strictly decreasing at n=%d: prev=%g cur=%g", n, prev, cur)
+			}
+			prev = cur
+		}
+	})
+
+	t.Run("matches Retention(ClusterNode)", func(t *testing.T) {
+		c := memory.ClusterNode{TurnsSince: 13, Utility: 0.7, Frequency: 0.2}
+		viaCluster := d.Retention(c)
+		viaScalar := d.RetentionFromState(0.7, 0.2, 13)
+		if math.Abs(viaCluster-viaScalar) > 1e-15 {
+			t.Errorf("Retention(c)=%g RetentionFromState(...)=%g; want equal", viaCluster, viaScalar)
+		}
+	})
 }
 
 func TestDecayerGateC(t *testing.T) {
@@ -131,7 +163,7 @@ func TestDecayerGateC(t *testing.T) {
 				Frequency:  0.5,
 			},
 			// S = 10.1, R = exp(-12/10.1) ≈ 0.3057 > 0.3 → true (barely)
-			want: Retention(12, 0.5, 0.5, 10.0) > 0.3,
+			want: ebbinghaus.Retention(12, 0.5, 0.5, 10.0) > 0.3,
 		},
 		{
 			name: "retention just below threshold",
@@ -141,7 +173,7 @@ func TestDecayerGateC(t *testing.T) {
 				Frequency:  0.5,
 			},
 			// S = 10.1, R = exp(-13/10.1) ≈ 0.2762 < 0.3 → false
-			want: Retention(13, 0.5, 0.5, 10.0) > 0.3,
+			want: ebbinghaus.Retention(13, 0.5, 0.5, 10.0) > 0.3,
 		},
 	}
 

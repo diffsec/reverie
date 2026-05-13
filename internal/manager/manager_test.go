@@ -270,3 +270,126 @@ func TestTickDecay_EmptyAccessed(t *testing.T) {
 		t.Errorf("clusterB.TurnsSince = %d, want 1 (all bumped)", cB.TurnsSince)
 	}
 }
+
+// upsertEntity is a helper that adds an entity to the store, using an
+// orthogonal one-hot vector at `slot` so dedupe-by-similarity cannot
+// collapse two distinct calls onto the same row.
+func upsertEntity(t *testing.T, s memory.Store, name string, slot int) string {
+	t.Helper()
+	ctx := context.Background()
+	emb := make([]float32, 8)
+	emb[slot%len(emb)] = 1.0
+	id, _, sim, err := s.UpsertEntity(ctx, name, "file", emb)
+	if err != nil {
+		t.Fatalf("UpsertEntity(%s): %v", name, err)
+	}
+	if sim {
+		t.Fatalf("UpsertEntity(%s): unexpected similarity collision (slot=%d)", name, slot)
+	}
+	return id
+}
+
+// getEntity is a helper that looks up an entity by id.
+func getEntity(t *testing.T, s memory.Store, id string) memory.Entity {
+	t.Helper()
+	ent, err := s.GetEntity(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetEntity(%s): %v", id, err)
+	}
+	return ent
+}
+
+// TestManagerTickDecayWithEntities asserts that the entity-aware tick
+// path bumps every entity exactly once per call. Two ticks with an empty
+// entity access set leave both entities at turns_since=2 and retention<1.
+func TestManagerTickDecayWithEntities(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemStore()
+	d := newTestDecayer()
+	mgr := NewMemoryManager(store, d, 0.10, 0.05)
+
+	e1 := upsertEntity(t, store, "alpha", 0)
+	e2 := upsertEntity(t, store, "beta", 1)
+
+	for i := 0; i < 2; i++ {
+		if err := mgr.TickDecayWithEntities(ctx, nil, nil); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+
+	for _, id := range []string{e1, e2} {
+		ent := getEntity(t, store, id)
+		if ent.TurnsSince != 2 {
+			t.Errorf("entity %s: turns_since=%d, want 2", id, ent.TurnsSince)
+		}
+		if ent.Retention >= 1.0 {
+			t.Errorf("entity %s: retention=%v, want < 1.0", id, ent.Retention)
+		}
+	}
+}
+
+// TestManagerTickDecayWithEntities_PartialAccess asserts the access set
+// applies per-entity: the named entity resets while the other entity
+// continues to age. Also confirms TickDecay (legacy wrapper) still bumps
+// entities at all (otherwise this test would equal turns_since=1 for the
+// untouched entity).
+func TestManagerTickDecayWithEntities_PartialAccess(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemStore()
+	d := newTestDecayer()
+	mgr := NewMemoryManager(store, d, 0.10, 0.05)
+
+	hot := upsertEntity(t, store, "hot", 0)
+	cold := upsertEntity(t, store, "cold", 1)
+
+	// First tick: both age by 1.
+	if err := mgr.TickDecayWithEntities(ctx, nil, nil); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	// Second tick: only the "hot" entity is accessed → resets to 0.
+	if err := mgr.TickDecayWithEntities(ctx, nil, []string{hot}); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+
+	hotEnt := getEntity(t, store, hot)
+	if hotEnt.TurnsSince != 0 {
+		t.Errorf("hot.TurnsSince=%d, want 0 after reset", hotEnt.TurnsSince)
+	}
+	coldEnt := getEntity(t, store, cold)
+	if coldEnt.TurnsSince != 2 {
+		t.Errorf("cold.TurnsSince=%d, want 2 after two unaccessed ticks", coldEnt.TurnsSince)
+	}
+	if coldEnt.Retention >= 1.0 {
+		t.Errorf("cold.Retention=%v, want < 1.0 (decayed)", coldEnt.Retention)
+	}
+}
+
+// TestManagerTickDecay_LegacyWrapper confirms the old TickDecay signature
+// still works AND bumps entities (via the wrapper into
+// TickDecayWithEntities with a nil entity access set). The session-end
+// path uses TickDecayWithEntities directly; every other caller still
+// flows through TickDecay.
+func TestManagerTickDecay_LegacyWrapper(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemStore()
+	d := newTestDecayer()
+	mgr := NewMemoryManager(store, d, 0.10, 0.05)
+
+	insertFact(t, store, "fA", "clusterA", "fact for A")
+	id := upsertEntity(t, store, "wrapper-entity", 0)
+
+	if err := mgr.TickDecay(ctx, []string{"clusterA"}); err != nil {
+		t.Fatalf("TickDecay: %v", err)
+	}
+
+	// Cluster reset.
+	cA, _ := store.GetCluster(ctx, "clusterA")
+	if cA.TurnsSince != 0 {
+		t.Errorf("clusterA.TurnsSince=%d, want 0 (in access set)", cA.TurnsSince)
+	}
+	// Entity bumped (entity access set was nil).
+	ent := getEntity(t, store, id)
+	if ent.TurnsSince != 1 {
+		t.Errorf("entity.TurnsSince=%d, want 1 (legacy wrapper still ticks entities)", ent.TurnsSince)
+	}
+}

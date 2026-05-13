@@ -133,6 +133,94 @@ ALTER TABLE sessions ADD COLUMN created_at TEXT DEFAULT (datetime('now'));
 ALTER TABLE sessions ADD COLUMN closed_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);`,
 	},
+	{
+		Version: 5,
+		Name:    "knowledge_graph",
+		// Promotes the proto-graph (fact_episode_links) to a real knowledge
+		// graph for Phase 7. Three new tables are created and the legacy
+		// links table is replaced by the more general memory_edges:
+		//
+		//   memory_edges    — typed, weighted, directed edges between any
+		//                     two memory IDs (fact, episode, or entity).
+		//                     src_id/dst_id are deliberately polymorphic —
+		//                     no FK on either column — because the layer of
+		//                     the endpoint is decided at the application
+		//                     layer. Indexes on src_id and dst_id make
+		//                     either-direction traversal cheap; the
+		//                     PRIMARY KEY (src,dst,type) gives INSERT OR
+		//                     IGNORE its idempotency.
+		//
+		//   entities        — first-class graph nodes (files, repos, libs,
+		//                     concepts, …) that decay using the same
+		//                     Ebbinghaus formula as L1 clusters. Default
+		//                     utility/frequency/retention match a fresh
+		//                     cluster so the first decay tick can't
+		//                     immediately drop a new entity below
+		//                     threshold. UNIQUE(name, entity_type) gates
+		//                     dedup by exact match; cosine-similarity
+		//                     dedup runs application-side before INSERT.
+		//
+		//   entity_mentions — memory -> entity many-to-many. memory_id is
+		//                     polymorphic over facts and episodes; no FK
+		//                     for the same reason as memory_edges.
+		//                     PRIMARY KEY (memory_id, entity_id) keeps the
+		//                     write-side INSERT OR IGNORE idempotent.
+		//
+		// Data move: every existing fact_episode_links row is copied into
+		// memory_edges with src_id=fact_id, dst_id=episode_id. The
+		// COALESCE on link_type defends against NULLs that may have been
+		// written before Phase 4 enforced the 'evidence' default — Phase
+		// 4 added the DEFAULT but didn't backfill NULL columns. created_at
+		// is stamped to datetime('now') because the legacy table never
+		// stored a creation timestamp; we'd rather have "migrated at
+		// migration time" than NULL.
+		//
+		// fact_episode_links is then dropped. The previous ON DELETE
+		// CASCADE was carried by SQLite FKs; on memory_edges and
+		// entity_mentions the application layer (DeleteFact/DeleteEpisode
+		// in the store) is responsible for the cascade, because the IDs
+		// are polymorphic.
+		SQL: `CREATE TABLE memory_edges (
+  src_id      TEXT NOT NULL,
+  dst_id      TEXT NOT NULL,
+  edge_type   TEXT NOT NULL,
+  weight      REAL DEFAULT 1.0,
+  created_at  TEXT,
+  PRIMARY KEY (src_id, dst_id, edge_type)
+);
+CREATE INDEX idx_edges_src ON memory_edges(src_id);
+CREATE INDEX idx_edges_dst ON memory_edges(dst_id);
+
+CREATE TABLE entities (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  entity_type  TEXT NOT NULL,
+  embedding    BLOB,
+  utility      REAL DEFAULT 0.5,
+  frequency    REAL DEFAULT 0.5,
+  turns_since  INTEGER DEFAULT 0,
+  retention    REAL DEFAULT 1.0,
+  last_access  TEXT,
+  created_at   TEXT,
+  UNIQUE(name, entity_type)
+);
+
+CREATE TABLE entity_mentions (
+  memory_id  TEXT NOT NULL,
+  entity_id  TEXT NOT NULL,
+  role       TEXT,
+  PRIMARY KEY (memory_id, entity_id)
+);
+
+-- Forward every fact_episode_links row into memory_edges. COALESCE keeps
+-- pre-Phase-4 NULL link_type rows from violating the NOT NULL on edge_type
+-- by substituting the canonical 'evidence' default.
+INSERT INTO memory_edges (src_id, dst_id, edge_type, created_at)
+SELECT fact_id, episode_id, COALESCE(link_type, 'evidence'), datetime('now')
+FROM fact_episode_links;
+
+DROP TABLE fact_episode_links;`,
+	},
 }
 
 // applyMigrations ensures the schema_migrations bookkeeping table exists and

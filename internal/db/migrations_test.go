@@ -58,8 +58,13 @@ func TestApplyMigrations_FreshDB(t *testing.T) {
 		}
 	}
 
-	// Initial-schema tables exist.
-	for _, tbl := range []string{"clusters", "facts", "episodes", "fact_episode_links", "embedding_cache", "sessions"} {
+	// Initial-schema tables exist. fact_episode_links is intentionally
+	// absent — migration 5 (knowledge_graph) drops it after forwarding its
+	// rows into memory_edges.
+	for _, tbl := range []string{
+		"clusters", "facts", "episodes", "embedding_cache", "sessions",
+		"memory_edges", "entities", "entity_mentions",
+	} {
 		if countRows(t, db, tbl) < 0 {
 			t.Errorf("table %q should exist", tbl)
 		}
@@ -593,5 +598,161 @@ func TestMigration2AddsTagsColumns(t *testing.T) {
 	}
 	if m2.Name != "add_tags_columns" {
 		t.Errorf("migration 2 name = %q, want add_tags_columns", m2.Name)
+	}
+}
+
+// TestMigration5_DataMove exercises the Phase-7 knowledge-graph migration.
+// We stop the migration pipeline at v4, seed fact_episode_links with a
+// representative mix of rows (including a NULL link_type to exercise the
+// COALESCE), then plug migration 5 back in and assert the data was forwarded
+// into memory_edges with the right shape and that the legacy table is gone.
+func TestMigration5_DataMove(t *testing.T) {
+	// Same trim/restore trick the migration 3 test uses: peel off any
+	// migration with Version >= 5 while we seed pre-migration rows, then
+	// reattach and apply.
+	saved := migrations
+	t.Cleanup(func() { migrations = saved })
+
+	var laterMigs []migration
+	trimmed := make([]migration, 0, len(saved))
+	for _, m := range saved {
+		if m.Version >= 5 {
+			laterMigs = append(laterMigs, m)
+			continue
+		}
+		trimmed = append(trimmed, m)
+	}
+	migrations = trimmed
+
+	path := filepath.Join(t.TempDir(), "mig5_data.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatalf("pragma fk: %v", err)
+	}
+
+	if err := applyMigrations(raw); err != nil {
+		t.Fatalf("applyMigrations (up to 4): %v", err)
+	}
+
+	// Seed cluster, facts, episodes — all needed for FK validity in the
+	// legacy fact_episode_links table.
+	if _, err := raw.Exec(
+		`INSERT INTO clusters (id, summary) VALUES ('default', 'default')`,
+	); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+	factIDs := []string{"f1", "f2", "f3"}
+	for _, fid := range factIDs {
+		if _, err := raw.Exec(
+			`INSERT INTO facts (id, cluster_id, content, content_hash, created_at, accessed_at)
+			 VALUES (?, 'default', ?, ?, datetime('now'), datetime('now'))`,
+			fid, fid+" content", fid+"-hash",
+		); err != nil {
+			t.Fatalf("seed fact %s: %v", fid, err)
+		}
+	}
+	epIDs := []string{"e1", "e2"}
+	for _, eid := range epIDs {
+		if _, err := raw.Exec(
+			`INSERT INTO episodes (id, cluster_id, situation, action, outcome, preemptive, content_hash, created_at, accessed_at)
+			 VALUES (?, 'default', 'sit', 'act', 'out', 'pre', ?, datetime('now'), datetime('now'))`,
+			eid, eid+"-hash",
+		); err != nil {
+			t.Fatalf("seed episode %s: %v", eid, err)
+		}
+	}
+
+	// Seed link rows: mix explicit link_types with one NULL to exercise the
+	// COALESCE branch of the data-move.
+	type linkSeed struct {
+		factID, epID string
+		linkType     sql.NullString // .Valid=false -> NULL
+	}
+	seeds := []linkSeed{
+		{"f1", "e1", sql.NullString{String: "evidence", Valid: true}},
+		{"f2", "e1", sql.NullString{String: "supports", Valid: true}},
+		{"f3", "e2", sql.NullString{}}, // NULL link_type
+	}
+	for _, l := range seeds {
+		if _, err := raw.Exec(
+			`INSERT INTO fact_episode_links (fact_id, episode_id, link_type) VALUES (?, ?, ?)`,
+			l.factID, l.epID, l.linkType,
+		); err != nil {
+			t.Fatalf("seed link %s/%s: %v", l.factID, l.epID, err)
+		}
+	}
+
+	// Reattach migration 5+ and apply.
+	migrations = append(append([]migration{}, trimmed...), laterMigs...)
+	if err := applyMigrations(raw); err != nil {
+		t.Fatalf("applyMigrations (mig 5+): %v", err)
+	}
+
+	// memory_edges row count must equal what we seeded.
+	if got := countRows(t, raw, "memory_edges"); got != len(seeds) {
+		t.Fatalf("memory_edges row count = %d, want %d", got, len(seeds))
+	}
+
+	// Each (fact, episode) pair must appear as (src_id, dst_id) with the
+	// right edge_type — COALESCE converts NULL to 'evidence'.
+	wantByPair := map[string]string{
+		"f1|e1": "evidence",
+		"f2|e1": "supports",
+		"f3|e2": "evidence",
+	}
+	rows, err := raw.Query(`SELECT src_id, dst_id, edge_type, created_at FROM memory_edges ORDER BY src_id`)
+	if err != nil {
+		t.Fatalf("select memory_edges: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var src, dst, et, createdAt string
+		if err := rows.Scan(&src, &dst, &et, &createdAt); err != nil {
+			t.Fatalf("scan edge: %v", err)
+		}
+		key := src + "|" + dst
+		want, ok := wantByPair[key]
+		if !ok {
+			t.Errorf("unexpected edge (%s, %s, %s)", src, dst, et)
+			continue
+		}
+		if et != want {
+			t.Errorf("edge (%s, %s): edge_type=%q, want %q", src, dst, et, want)
+		}
+		if createdAt == "" {
+			t.Errorf("edge (%s, %s): created_at is empty, want datetime('now') stamp", src, dst)
+		}
+		delete(wantByPair, key)
+	}
+	if len(wantByPair) != 0 {
+		t.Errorf("missing edges after migration: %v", wantByPair)
+	}
+
+	// Legacy fact_episode_links must be gone — a SELECT against it errors.
+	if _, err := raw.Exec(`SELECT 1 FROM fact_episode_links`); err == nil {
+		t.Error("fact_episode_links table still exists after migration 5")
+	}
+
+	// The two new graph tables must exist and be empty (the data move only
+	// touches memory_edges).
+	if got := countRows(t, raw, "entities"); got != 0 {
+		t.Errorf("entities table not empty after migration 5: %d rows", got)
+	}
+	if got := countRows(t, raw, "entity_mentions"); got != 0 {
+		t.Errorf("entity_mentions table not empty after migration 5: %d rows", got)
+	}
+
+	// Second application is a no-op: schema_migrations gates the rerun.
+	beforeRows := countRows(t, raw, "memory_edges")
+	if err := applyMigrations(raw); err != nil {
+		t.Fatalf("applyMigrations (rerun): %v", err)
+	}
+	afterRows := countRows(t, raw, "memory_edges")
+	if beforeRows != afterRows {
+		t.Errorf("memory_edges row count changed on rerun: before=%d after=%d", beforeRows, afterRows)
 	}
 }

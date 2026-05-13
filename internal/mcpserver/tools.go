@@ -161,22 +161,37 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 			rc.Tags = normalizeTagsSlice(nil)
 		}
 
-		// Fetch cross-type linked IDs.
+		// Fetch cross-type linked IDs. Backed by memory_edges with
+		// edge_type='evidence' (the retired fact_episode_links semantic).
 		if c.Fact != nil {
-			links, linkErr := s.store.GetFactLinks(ctx, c.Fact.ID)
+			edges, linkErr := s.store.ListEdges(ctx, c.Fact.ID, 1)
 			if linkErr != nil {
-				s.logger.Warn("memory_recall: get fact links failed", "fact_id", c.Fact.ID, "err", linkErr)
+				s.logger.Warn("memory_recall: list edges failed", "fact_id", c.Fact.ID, "err", linkErr)
 			}
-			for _, l := range links {
-				rc.LinkedIDs = append(rc.LinkedIDs, l.EpisodeID)
+			for _, e := range edges {
+				if e.Edge.EdgeType != "evidence" {
+					continue
+				}
+				other := e.Edge.DstID
+				if e.Edge.SrcID != c.Fact.ID {
+					other = e.Edge.SrcID
+				}
+				rc.LinkedIDs = append(rc.LinkedIDs, other)
 			}
 		} else if c.Episode != nil {
-			links, linkErr := s.store.GetEpisodeLinks(ctx, c.Episode.ID)
+			edges, linkErr := s.store.ListEdges(ctx, c.Episode.ID, 1)
 			if linkErr != nil {
-				s.logger.Warn("memory_recall: get episode links failed", "episode_id", c.Episode.ID, "err", linkErr)
+				s.logger.Warn("memory_recall: list edges failed", "episode_id", c.Episode.ID, "err", linkErr)
 			}
-			for _, l := range links {
-				rc.LinkedIDs = append(rc.LinkedIDs, l.FactID)
+			for _, e := range edges {
+				if e.Edge.EdgeType != "evidence" {
+					continue
+				}
+				other := e.Edge.DstID
+				if e.Edge.SrcID != c.Episode.ID {
+					other = e.Edge.SrcID
+				}
+				rc.LinkedIDs = append(rc.LinkedIDs, other)
 			}
 		}
 
@@ -1932,16 +1947,27 @@ func (s *Server) buildGetOutputFact(ctx context.Context, f *memory.Fact) (*mcpsd
 		out.Supersedes = supersedes
 	}
 
-	// Cross-type links: episodes linked to this fact.
-	links, err := s.store.GetFactLinks(ctx, f.ID)
+	// Cross-type links: evidence edges from this fact's row in memory_edges.
+	// Preserves the pre-Phase-7 user-visible shape of memory_get.Links by
+	// filtering to edge_type='evidence' and resolving the "other" endpoint's
+	// layer via fact/episode lookup.
+	edges, err := s.store.ListEdges(ctx, f.ID, 1)
 	if err != nil {
-		return nil, GetOutput{}, fmt.Errorf("get fact links: %w", err)
+		return nil, GetOutput{}, fmt.Errorf("list edges: %w", err)
 	}
-	for _, l := range links {
+	for _, e := range edges {
+		if e.Edge.EdgeType != "evidence" {
+			continue
+		}
+		other := e.Edge.DstID
+		if e.Edge.SrcID != f.ID {
+			other = e.Edge.SrcID
+		}
+		layer := resolveLayerString(ctx, s, other)
 		out.Links = append(out.Links, LinkRef{
-			ID:       l.EpisodeID,
-			Layer:    string(memory.TypeL3Episodic),
-			LinkType: l.LinkType,
+			ID:       other,
+			Layer:    layer,
+			LinkType: e.Edge.EdgeType,
 		})
 	}
 
@@ -1973,21 +1999,48 @@ func (s *Server) buildGetOutputEpisode(ctx context.Context, ep *memory.Episode) 
 
 	s.populateClusterSummary(ctx, ep.ClusterID, &out)
 
-	// Cross-type links: facts linked to this episode.
-	links, err := s.store.GetEpisodeLinks(ctx, ep.ID)
+	// Cross-type links: evidence edges from this episode's row in memory_edges.
+	// Preserves the pre-Phase-7 user-visible shape of memory_get.Links by
+	// filtering to edge_type='evidence' and resolving the "other" endpoint's
+	// layer via fact/episode lookup.
+	edges, err := s.store.ListEdges(ctx, ep.ID, 1)
 	if err != nil {
-		return nil, GetOutput{}, fmt.Errorf("get episode links: %w", err)
+		return nil, GetOutput{}, fmt.Errorf("list edges: %w", err)
 	}
-	for _, l := range links {
+	for _, e := range edges {
+		if e.Edge.EdgeType != "evidence" {
+			continue
+		}
+		other := e.Edge.DstID
+		if e.Edge.SrcID != ep.ID {
+			other = e.Edge.SrcID
+		}
+		layer := resolveLayerString(ctx, s, other)
 		out.Links = append(out.Links, LinkRef{
-			ID:       l.FactID,
-			Layer:    string(memory.TypeL2Semantic),
-			LinkType: l.LinkType,
+			ID:       other,
+			Layer:    layer,
+			LinkType: e.Edge.EdgeType,
 		})
 	}
 
 	s.logger.Info("memory_get", "id", ep.ID, "layer", "l3_episodic")
 	return nil, out, nil
+}
+
+// resolveLayerString classifies a memory ID as "l2_semantic", "l3_episodic",
+// or "entity" by trying each table in turn. Returns "" if none match (e.g.,
+// orphan reference). Used to populate LinkRef.Layer / EdgeDetail.OtherLayer.
+func resolveLayerString(ctx context.Context, s *Server, id string) string {
+	if f, err := s.store.GetFact(ctx, id); err == nil && f != nil {
+		return string(memory.TypeL2Semantic)
+	}
+	if ep, err := s.store.GetEpisode(ctx, id); err == nil && ep != nil {
+		return string(memory.TypeL3Episodic)
+	}
+	if ent, err := s.store.GetEntity(ctx, id); err == nil && ent.ID != "" {
+		return "entity"
+	}
+	return ""
 }
 
 // populateClusterSummary looks up the cluster and fills ClusterSummary if the
@@ -2082,63 +2135,23 @@ func (s *Server) handleUnsupersede(ctx context.Context, _ *mcpsdk.CallToolReques
 	return nil, out, nil
 }
 
-// --- memory_link / memory_unlink / memory_list_links (Phase 4A) ---
+// --- Phase 7 knowledge graph tools ---
+//
+// Six MCP tools that replace the retired memory_link / memory_unlink /
+// memory_list_links surface from Phase 4A. The new tools cover the full
+// knowledge graph: typed/weighted edges between any two memory or entity
+// IDs (memory_edge_add / memory_edge_remove / memory_edge_list), and a
+// first-class entity layer (memory_entity_upsert / memory_entity_mention /
+// memory_entity_neighbors). See docs/design/phase-7-knowledge-graph.md
+// for the locked decisions and tool-shape source of truth.
 
-// LinkInput is the input schema for the memory_link tool.
-type LinkInput struct {
-	FactID    string `json:"fact_id" jsonschema:"L2 fact ID"`
-	EpisodeID string `json:"episode_id" jsonschema:"L3 episode ID"`
-	LinkType  string `json:"link_type,omitempty" jsonschema:"link type label (default \"evidence\")"`
-}
+// edgePreviewMax is the max length of content_preview fields returned by
+// memory_edge_list and memory_entity_neighbors.
+const edgePreviewMax = 120
 
-// LinkOutput is the output schema for the memory_link tool.
-type LinkOutput struct {
-	FactID    string `json:"fact_id"`
-	EpisodeID string `json:"episode_id"`
-	LinkType  string `json:"link_type"`
-	Created   bool   `json:"created"`
-}
-
-// UnlinkInput is the input schema for the memory_unlink tool.
-type UnlinkInput struct {
-	FactID    string `json:"fact_id" jsonschema:"L2 fact ID"`
-	EpisodeID string `json:"episode_id" jsonschema:"L3 episode ID"`
-}
-
-// UnlinkOutput is the output schema for the memory_unlink tool.
-type UnlinkOutput struct {
-	FactID    string `json:"fact_id"`
-	EpisodeID string `json:"episode_id"`
-	Deleted   bool   `json:"deleted"`
-}
-
-// ListLinksInput is the input schema for the memory_list_links tool.
-type ListLinksInput struct {
-	MemoryID string `json:"memory_id" jsonschema:"fact or episode ID"`
-}
-
-// LinkDetail describes a single link from the perspective of the queried memory.
-// ID is the OTHER side of the link.
-type LinkDetail struct {
-	ID             string `json:"id"`
-	Layer          string `json:"layer"`
-	LinkType       string `json:"link_type"`
-	ContentPreview string `json:"content_preview"`
-}
-
-// ListLinksOutput is the output schema for the memory_list_links tool.
-type ListLinksOutput struct {
-	MemoryID string       `json:"memory_id"`
-	Layer    string       `json:"layer"`
-	Links    []LinkDetail `json:"links"`
-}
-
-// linkPreviewMax is the max length of the content_preview field in LinkDetail.
-const linkPreviewMax = 120
-
-// truncatePreview trims s to at most n runes, appending nothing — the spec
-// simply says "truncated to 120 chars." A char here is a byte for simplicity
-// (same convention used elsewhere in the codebase for length limits).
+// truncatePreview trims s to at most n bytes. A char here is a byte for
+// simplicity (same convention used elsewhere in the codebase for length
+// limits).
 func truncatePreview(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -2146,166 +2159,472 @@ func truncatePreview(s string, n int) string {
 	return s[:n]
 }
 
-func (s *Server) handleLink(ctx context.Context, _ *mcpsdk.CallToolRequest, in LinkInput) (*mcpsdk.CallToolResult, LinkOutput, error) {
+// --- memory_edge_add ---
+
+// EdgeAddInput is the input schema for the memory_edge_add tool.
+type EdgeAddInput struct {
+	SrcID    string   `json:"src_id" jsonschema:"source memory ID (fact, episode, or entity)"`
+	DstID    string   `json:"dst_id" jsonschema:"destination memory ID"`
+	EdgeType string   `json:"edge_type" jsonschema:"free-form; canonical types in README"`
+	Weight   *float64 `json:"weight,omitempty" jsonschema:"default 1.0"`
+}
+
+// EdgeAddOutput is the output schema for the memory_edge_add tool.
+type EdgeAddOutput struct {
+	SrcID    string  `json:"src_id"`
+	DstID    string  `json:"dst_id"`
+	EdgeType string  `json:"edge_type"`
+	Weight   float64 `json:"weight"`
+	Created  bool    `json:"created"`
+}
+
+func (s *Server) handleEdgeAdd(ctx context.Context, _ *mcpsdk.CallToolRequest, in EdgeAddInput) (*mcpsdk.CallToolResult, EdgeAddOutput, error) {
 	if s.cfg.Server.Disabled {
 		return &mcpsdk.CallToolResult{
 			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
-		}, LinkOutput{}, nil
+		}, EdgeAddOutput{}, nil
 	}
 
-	if in.FactID == "" {
-		return nil, LinkOutput{}, fmt.Errorf("fact_id is required")
+	if in.SrcID == "" {
+		return nil, EdgeAddOutput{}, fmt.Errorf("src_id is required")
 	}
-	if in.EpisodeID == "" {
-		return nil, LinkOutput{}, fmt.Errorf("episode_id is required")
+	if in.DstID == "" {
+		return nil, EdgeAddOutput{}, fmt.Errorf("dst_id is required")
 	}
-
-	linkType := in.LinkType
-	if linkType == "" {
-		linkType = "evidence"
+	if in.EdgeType == "" {
+		return nil, EdgeAddOutput{}, fmt.Errorf("edge_type is required")
 	}
 
-	// Validate fact_id is a fact (not an episode).
-	fact, err := s.store.GetFact(ctx, in.FactID)
+	// Validate both IDs resolve to a fact, episode, or entity. Conservative
+	// "fail loud on unknown IDs" stance preserves the old handleLink behavior.
+	if resolveLayerString(ctx, s, in.SrcID) == "" {
+		return nil, EdgeAddOutput{}, fmt.Errorf("src_id not found: %s", in.SrcID)
+	}
+	if resolveLayerString(ctx, s, in.DstID) == "" {
+		return nil, EdgeAddOutput{}, fmt.Errorf("dst_id not found: %s", in.DstID)
+	}
+
+	weight := 1.0
+	if in.Weight != nil {
+		weight = *in.Weight
+	}
+
+	edge := memory.Edge{
+		SrcID:    in.SrcID,
+		DstID:    in.DstID,
+		EdgeType: in.EdgeType,
+		Weight:   weight,
+	}
+	created, err := s.store.AddEdge(ctx, edge)
 	if err != nil {
-		return nil, LinkOutput{}, fmt.Errorf("get fact: %w", err)
+		return nil, EdgeAddOutput{}, fmt.Errorf("add edge: %w", err)
 	}
-	if fact == nil {
-		// Disambiguate: is this ID an episode?
-		ep, _ := s.store.GetEpisode(ctx, in.FactID)
-		if ep != nil {
-			return nil, LinkOutput{}, fmt.Errorf("fact_id %s is an episode, not a fact", in.FactID)
+
+	// Per the design doc's locked decision: idempotent repeat with a
+	// different weight does NOT overwrite — return the stored row's
+	// weight, not the caller's input weight.
+	canonicalWeight := weight
+	if !created {
+		existingEdges, lookupErr := s.store.ListEdges(ctx, in.SrcID, 1)
+		if lookupErr != nil {
+			return nil, EdgeAddOutput{}, fmt.Errorf("resolve stored edge weight: %w", lookupErr)
 		}
-		return nil, LinkOutput{}, fmt.Errorf("fact not found: %s", in.FactID)
-	}
-
-	// Validate episode_id is an episode (not a fact).
-	ep, err := s.store.GetEpisode(ctx, in.EpisodeID)
-	if err != nil {
-		return nil, LinkOutput{}, fmt.Errorf("get episode: %w", err)
-	}
-	if ep == nil {
-		other, _ := s.store.GetFact(ctx, in.EpisodeID)
-		if other != nil {
-			return nil, LinkOutput{}, fmt.Errorf("episode_id %s is a fact, not an episode", in.EpisodeID)
+		for _, ewd := range existingEdges {
+			if ewd.Edge.SrcID == in.SrcID &&
+				ewd.Edge.DstID == in.DstID &&
+				ewd.Edge.EdgeType == in.EdgeType {
+				canonicalWeight = ewd.Edge.Weight
+				break
+			}
 		}
-		return nil, LinkOutput{}, fmt.Errorf("episode not found: %s", in.EpisodeID)
 	}
 
-	created, err := s.store.LinkFactEpisode(ctx, in.FactID, in.EpisodeID, linkType)
-	if err != nil {
-		return nil, LinkOutput{}, fmt.Errorf("link fact episode: %w", err)
-	}
-
-	s.logger.Info("memory_link", "fact_id", in.FactID, "episode_id", in.EpisodeID, "link_type", linkType, "created", created)
-	return nil, LinkOutput{
-		FactID:    in.FactID,
-		EpisodeID: in.EpisodeID,
-		LinkType:  linkType,
-		Created:   created,
+	s.logger.Info("memory_edge_add",
+		"src_id", in.SrcID, "dst_id", in.DstID, "edge_type", in.EdgeType,
+		"weight", canonicalWeight, "created", created)
+	return nil, EdgeAddOutput{
+		SrcID:    in.SrcID,
+		DstID:    in.DstID,
+		EdgeType: in.EdgeType,
+		Weight:   canonicalWeight,
+		Created:  created,
 	}, nil
 }
 
-func (s *Server) handleUnlink(ctx context.Context, _ *mcpsdk.CallToolRequest, in UnlinkInput) (*mcpsdk.CallToolResult, UnlinkOutput, error) {
-	if s.cfg.Server.Disabled {
-		return &mcpsdk.CallToolResult{
-			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
-		}, UnlinkOutput{}, nil
-	}
+// --- memory_edge_remove ---
 
-	if in.FactID == "" {
-		return nil, UnlinkOutput{}, fmt.Errorf("fact_id is required")
-	}
-	if in.EpisodeID == "" {
-		return nil, UnlinkOutput{}, fmt.Errorf("episode_id is required")
-	}
-
-	deleted, err := s.store.UnlinkFactEpisode(ctx, in.FactID, in.EpisodeID)
-	if err != nil {
-		return nil, UnlinkOutput{}, fmt.Errorf("unlink fact episode: %w", err)
-	}
-
-	s.logger.Info("memory_unlink", "fact_id", in.FactID, "episode_id", in.EpisodeID, "deleted", deleted)
-	return nil, UnlinkOutput{
-		FactID:    in.FactID,
-		EpisodeID: in.EpisodeID,
-		Deleted:   deleted,
-	}, nil
+// EdgeRemoveInput is the input schema for the memory_edge_remove tool.
+type EdgeRemoveInput struct {
+	SrcID    string `json:"src_id" jsonschema:"source memory ID"`
+	DstID    string `json:"dst_id" jsonschema:"destination memory ID"`
+	EdgeType string `json:"edge_type" jsonschema:"edge type label"`
 }
 
-func (s *Server) handleListLinks(ctx context.Context, _ *mcpsdk.CallToolRequest, in ListLinksInput) (*mcpsdk.CallToolResult, ListLinksOutput, error) {
+// EdgeRemoveOutput is the output schema for the memory_edge_remove tool.
+type EdgeRemoveOutput struct {
+	Deleted bool `json:"deleted"`
+}
+
+func (s *Server) handleEdgeRemove(ctx context.Context, _ *mcpsdk.CallToolRequest, in EdgeRemoveInput) (*mcpsdk.CallToolResult, EdgeRemoveOutput, error) {
 	if s.cfg.Server.Disabled {
 		return &mcpsdk.CallToolResult{
 			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
-		}, ListLinksOutput{}, nil
+		}, EdgeRemoveOutput{}, nil
+	}
+
+	if in.SrcID == "" {
+		return nil, EdgeRemoveOutput{}, fmt.Errorf("src_id is required")
+	}
+	if in.DstID == "" {
+		return nil, EdgeRemoveOutput{}, fmt.Errorf("dst_id is required")
+	}
+	if in.EdgeType == "" {
+		return nil, EdgeRemoveOutput{}, fmt.Errorf("edge_type is required")
+	}
+
+	deleted, err := s.store.RemoveEdge(ctx, in.SrcID, in.DstID, in.EdgeType)
+	if err != nil {
+		return nil, EdgeRemoveOutput{}, fmt.Errorf("remove edge: %w", err)
+	}
+
+	s.logger.Info("memory_edge_remove",
+		"src_id", in.SrcID, "dst_id", in.DstID, "edge_type", in.EdgeType, "deleted", deleted)
+	return nil, EdgeRemoveOutput{Deleted: deleted}, nil
+}
+
+// --- memory_edge_list ---
+
+// EdgeListInput is the input schema for the memory_edge_list tool.
+type EdgeListInput struct {
+	MemoryID string `json:"memory_id" jsonschema:"fact, episode, or entity ID"`
+	Hops     int    `json:"hops,omitempty" jsonschema:"1..3, default 1"`
+}
+
+// EdgeDetail describes a single edge from the perspective of the seed
+// memory. OtherID is the endpoint that BFS reached at this depth — at
+// hops=1 it is the non-seed endpoint of the single edge row; at hops>=2
+// the seed itself no longer participates directly, and OtherID is the
+// newly-reached node (i.e., the endpoint that was not already in the
+// visited set at the moment BFS emitted this row).
+type EdgeDetail struct {
+	OtherID        string  `json:"other_id"`
+	OtherLayer     string  `json:"other_layer"`
+	EdgeType       string  `json:"edge_type"`
+	Weight         float64 `json:"weight"`
+	Distance       int     `json:"distance"`
+	ContentPreview string  `json:"content_preview"`
+}
+
+// EdgeListOutput is the output schema for the memory_edge_list tool.
+type EdgeListOutput struct {
+	MemoryID string       `json:"memory_id"`
+	Layer    string       `json:"layer"`
+	Edges    []EdgeDetail `json:"edges"`
+}
+
+func (s *Server) handleEdgeList(ctx context.Context, _ *mcpsdk.CallToolRequest, in EdgeListInput) (*mcpsdk.CallToolResult, EdgeListOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, EdgeListOutput{}, nil
 	}
 
 	if in.MemoryID == "" {
-		return nil, ListLinksOutput{}, fmt.Errorf("memory_id is required")
+		return nil, EdgeListOutput{}, fmt.Errorf("memory_id is required")
 	}
 
-	// Try fact first.
-	fact, err := s.store.GetFact(ctx, in.MemoryID)
+	hops := in.Hops
+	if hops == 0 {
+		hops = 1
+	}
+	if hops < 1 || hops > 3 {
+		return nil, EdgeListOutput{}, fmt.Errorf("hops out of range: %d (must be 1..3)", hops)
+	}
+
+	seedLayer := resolveLayerString(ctx, s, in.MemoryID)
+	if seedLayer == "" {
+		return nil, EdgeListOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
+	}
+
+	rawEdges, err := s.store.ListEdges(ctx, in.MemoryID, hops)
 	if err != nil {
-		return nil, ListLinksOutput{}, fmt.Errorf("get fact: %w", err)
-	}
-	if fact != nil {
-		epLinks, err := s.store.GetFactLinks(ctx, fact.ID)
-		if err != nil {
-			return nil, ListLinksOutput{}, fmt.Errorf("get fact links: %w", err)
-		}
-		details := make([]LinkDetail, 0, len(epLinks))
-		for _, l := range epLinks {
-			preview := ""
-			if l.Episode != nil {
-				preview = truncatePreview(memory.Candidate{Episode: l.Episode}.Content(), linkPreviewMax)
-			}
-			details = append(details, LinkDetail{
-				ID:             l.EpisodeID,
-				Layer:          string(memory.TypeL3Episodic),
-				LinkType:       l.LinkType,
-				ContentPreview: preview,
-			})
-		}
-		s.logger.Info("memory_list_links", "memory_id", fact.ID, "layer", "l2_semantic", "count", len(details))
-		return nil, ListLinksOutput{
-			MemoryID: fact.ID,
-			Layer:    string(memory.TypeL2Semantic),
-			Links:    details,
-		}, nil
+		return nil, EdgeListOutput{}, fmt.Errorf("list edges: %w", err)
 	}
 
-	ep, err := s.store.GetEpisode(ctx, in.MemoryID)
+	// Mirror the store's BFS visited-set so we can determine OtherID for
+	// hops >= 2: the endpoint that is NOT in visited at row-emission time
+	// is the newly-reached "other". The store guarantees exactly one of
+	// (src, dst) is in visited per emitted row, so this is unambiguous.
+	visited := map[string]struct{}{in.MemoryID: {}}
+	details := make([]EdgeDetail, 0, len(rawEdges))
+	for _, ewd := range rawEdges {
+		var other string
+		if _, ok := visited[ewd.Edge.SrcID]; ok {
+			other = ewd.Edge.DstID
+		} else {
+			other = ewd.Edge.SrcID
+		}
+		visited[other] = struct{}{}
+
+		otherLayer := resolveLayerString(ctx, s, other)
+		preview := buildContentPreview(ctx, s, other, otherLayer)
+
+		details = append(details, EdgeDetail{
+			OtherID:        other,
+			OtherLayer:     otherLayer,
+			EdgeType:       ewd.Edge.EdgeType,
+			Weight:         ewd.Edge.Weight,
+			Distance:       ewd.Distance,
+			ContentPreview: preview,
+		})
+	}
+
+	s.logger.Info("memory_edge_list",
+		"memory_id", in.MemoryID, "layer", seedLayer, "hops", hops, "count", len(details))
+	return nil, EdgeListOutput{
+		MemoryID: in.MemoryID,
+		Layer:    seedLayer,
+		Edges:    details,
+	}, nil
+}
+
+// buildContentPreview returns a 120-char preview for the memory at id based
+// on its layer. Empty string when the layer is unknown or the row is missing.
+func buildContentPreview(ctx context.Context, s *Server, id, layer string) string {
+	switch layer {
+	case string(memory.TypeL2Semantic):
+		f, err := s.store.GetFact(ctx, id)
+		if err != nil || f == nil {
+			return ""
+		}
+		return truncatePreview(f.Content, edgePreviewMax)
+	case string(memory.TypeL3Episodic):
+		ep, err := s.store.GetEpisode(ctx, id)
+		if err != nil || ep == nil {
+			return ""
+		}
+		return truncatePreview(memory.Candidate{Episode: ep}.Content(), edgePreviewMax)
+	case "entity":
+		ent, err := s.store.GetEntity(ctx, id)
+		if err != nil || ent.ID == "" {
+			return ""
+		}
+		return truncatePreview(ent.Name+" ("+ent.EntityType+")", edgePreviewMax)
+	}
+	return ""
+}
+
+// --- memory_entity_upsert ---
+
+// EntityUpsertInput is the input schema for the memory_entity_upsert tool.
+type EntityUpsertInput struct {
+	Name       string `json:"name" jsonschema:"entity name"`
+	EntityType string `json:"entity_type" jsonschema:"file/repo/library/concept/person/command/..."`
+}
+
+// EntityUpsertOutput is the output schema for the memory_entity_upsert tool.
+type EntityUpsertOutput struct {
+	EntityID            string `json:"entity_id"`
+	Created             bool   `json:"created"`
+	MatchedBySimilarity bool   `json:"matched_by_similarity"`
+}
+
+func (s *Server) handleEntityUpsert(ctx context.Context, _ *mcpsdk.CallToolRequest, in EntityUpsertInput) (*mcpsdk.CallToolResult, EntityUpsertOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, EntityUpsertOutput{}, nil
+	}
+
+	if in.Name == "" {
+		return nil, EntityUpsertOutput{}, fmt.Errorf("name is required")
+	}
+	if in.EntityType == "" {
+		return nil, EntityUpsertOutput{}, fmt.Errorf("entity_type is required")
+	}
+
+	// Embed the deterministic text per the locked decision: name + " (" + entity_type + ")".
+	// Best-effort: if the embedder is unavailable, fall through with a nil
+	// embedding so the entity can still be stored and found by exact match.
+	embedText := in.Name + " (" + in.EntityType + ")"
+	var embedding []float32
+	vecs, err := s.embedder.Embed(ctx, []string{embedText})
 	if err != nil {
-		return nil, ListLinksOutput{}, fmt.Errorf("get episode: %w", err)
-	}
-	if ep != nil {
-		factLinks, err := s.store.GetEpisodeLinks(ctx, ep.ID)
-		if err != nil {
-			return nil, ListLinksOutput{}, fmt.Errorf("get episode links: %w", err)
-		}
-		details := make([]LinkDetail, 0, len(factLinks))
-		for _, l := range factLinks {
-			preview := ""
-			if l.Fact != nil {
-				preview = truncatePreview(l.Fact.Content, linkPreviewMax)
-			}
-			details = append(details, LinkDetail{
-				ID:             l.FactID,
-				Layer:          string(memory.TypeL2Semantic),
-				LinkType:       l.LinkType,
-				ContentPreview: preview,
-			})
-		}
-		s.logger.Info("memory_list_links", "memory_id", ep.ID, "layer", "l3_episodic", "count", len(details))
-		return nil, ListLinksOutput{
-			MemoryID: ep.ID,
-			Layer:    string(memory.TypeL3Episodic),
-			Links:    details,
-		}, nil
+		s.logger.Warn("memory_entity_upsert: embed failed; inserting without embedding",
+			"name", in.Name, "entity_type", in.EntityType, "err", err)
+	} else if len(vecs) > 0 && len(vecs[0]) > 0 {
+		embedding = vecs[0]
 	}
 
-	return nil, ListLinksOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
+	id, created, matched, err := s.store.UpsertEntity(ctx, in.Name, in.EntityType, embedding)
+	if err != nil {
+		return nil, EntityUpsertOutput{}, fmt.Errorf("upsert entity: %w", err)
+	}
+
+	s.logger.Info("memory_entity_upsert",
+		"entity_id", id, "name", in.Name, "entity_type", in.EntityType,
+		"created", created, "matched_by_similarity", matched)
+	return nil, EntityUpsertOutput{
+		EntityID:            id,
+		Created:             created,
+		MatchedBySimilarity: matched,
+	}, nil
+}
+
+// --- memory_entity_mention ---
+
+// EntityMentionInput is the input schema for the memory_entity_mention tool.
+type EntityMentionInput struct {
+	MemoryID  string   `json:"memory_id" jsonschema:"fact or episode ID"`
+	EntityIDs []string `json:"entity_ids" jsonschema:"one or more entity IDs"`
+	Role      string   `json:"role,omitempty" jsonschema:"advisory: subject/object/mention"`
+}
+
+// EntityMentionOutput is the output schema for the memory_entity_mention tool.
+type EntityMentionOutput struct {
+	Inserted int `json:"inserted"`
+}
+
+func (s *Server) handleEntityMention(ctx context.Context, _ *mcpsdk.CallToolRequest, in EntityMentionInput) (*mcpsdk.CallToolResult, EntityMentionOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, EntityMentionOutput{}, nil
+	}
+
+	if in.MemoryID == "" {
+		return nil, EntityMentionOutput{}, fmt.Errorf("memory_id is required")
+	}
+	if len(in.EntityIDs) == 0 {
+		return nil, EntityMentionOutput{}, fmt.Errorf("entity_ids must be non-empty")
+	}
+
+	// Validate memory_id resolves to a fact or episode (NOT entity).
+	memLayer := resolveLayerString(ctx, s, in.MemoryID)
+	switch memLayer {
+	case string(memory.TypeL2Semantic), string(memory.TypeL3Episodic):
+		// ok
+	case "entity":
+		return nil, EntityMentionOutput{}, fmt.Errorf("memory_id %s is an entity; mentions are memory->entity only", in.MemoryID)
+	default:
+		return nil, EntityMentionOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
+	}
+
+	// Validate every entity_id resolves to an entity.
+	for _, eid := range in.EntityIDs {
+		if eid == "" {
+			return nil, EntityMentionOutput{}, fmt.Errorf("entity_ids contains empty string")
+		}
+		ent, err := s.store.GetEntity(ctx, eid)
+		if err != nil {
+			return nil, EntityMentionOutput{}, fmt.Errorf("get entity %s: %w", eid, err)
+		}
+		if ent.ID == "" {
+			return nil, EntityMentionOutput{}, fmt.Errorf("entity not found: %s", eid)
+		}
+	}
+
+	inserted, err := s.store.AddEntityMentions(ctx, in.MemoryID, in.EntityIDs, in.Role)
+	if err != nil {
+		return nil, EntityMentionOutput{}, fmt.Errorf("add entity mentions: %w", err)
+	}
+
+	s.logger.Info("memory_entity_mention",
+		"memory_id", in.MemoryID, "entity_count", len(in.EntityIDs),
+		"role", in.Role, "inserted", inserted)
+	return nil, EntityMentionOutput{Inserted: inserted}, nil
+}
+
+// --- memory_entity_neighbors ---
+
+// EntityNeighborsInput is the input schema for the memory_entity_neighbors tool.
+type EntityNeighborsInput struct {
+	EntityID string `json:"entity_id" jsonschema:"seed entity ID"`
+	Hops     int    `json:"hops,omitempty" jsonschema:"1..3, default 1"`
+}
+
+// NeighborMemoryOut is a memory neighbor returned by memory_entity_neighbors.
+type NeighborMemoryOut struct {
+	ID             string `json:"id"`
+	Layer          string `json:"layer"`
+	ContentPreview string `json:"content_preview"`
+	Distance       int    `json:"distance"`
+}
+
+// NeighborEntityOut is an entity neighbor returned by memory_entity_neighbors.
+type NeighborEntityOut struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	EntityType string `json:"entity_type"`
+	Distance   int    `json:"distance"`
+}
+
+// EntityNeighborsOutput is the output schema for the memory_entity_neighbors tool.
+type EntityNeighborsOutput struct {
+	EntityID string              `json:"entity_id"`
+	Memories []NeighborMemoryOut `json:"memories"`
+	Entities []NeighborEntityOut `json:"entities"`
+}
+
+func (s *Server) handleEntityNeighbors(ctx context.Context, _ *mcpsdk.CallToolRequest, in EntityNeighborsInput) (*mcpsdk.CallToolResult, EntityNeighborsOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, EntityNeighborsOutput{}, nil
+	}
+
+	if in.EntityID == "" {
+		return nil, EntityNeighborsOutput{}, fmt.Errorf("entity_id is required")
+	}
+
+	hops := in.Hops
+	if hops == 0 {
+		hops = 1
+	}
+	if hops < 1 || hops > 3 {
+		return nil, EntityNeighborsOutput{}, fmt.Errorf("hops out of range: %d (must be 1..3)", hops)
+	}
+
+	ent, err := s.store.GetEntity(ctx, in.EntityID)
+	if err != nil {
+		return nil, EntityNeighborsOutput{}, fmt.Errorf("get entity: %w", err)
+	}
+	if ent.ID == "" {
+		return nil, EntityNeighborsOutput{}, fmt.Errorf("entity not found: %s", in.EntityID)
+	}
+
+	memories, entities, err := s.store.ListEntityNeighbors(ctx, in.EntityID, hops)
+	if err != nil {
+		return nil, EntityNeighborsOutput{}, fmt.Errorf("list entity neighbors: %w", err)
+	}
+
+	memOut := make([]NeighborMemoryOut, 0, len(memories))
+	for _, m := range memories {
+		memOut = append(memOut, NeighborMemoryOut{
+			ID:             m.ID,
+			Layer:          string(m.Layer),
+			ContentPreview: m.ContentPreview,
+			Distance:       m.Distance,
+		})
+	}
+	entOut := make([]NeighborEntityOut, 0, len(entities))
+	for _, e := range entities {
+		entOut = append(entOut, NeighborEntityOut{
+			ID:         e.ID,
+			Name:       e.Name,
+			EntityType: e.EntityType,
+			Distance:   e.Distance,
+		})
+	}
+
+	s.logger.Info("memory_entity_neighbors",
+		"entity_id", in.EntityID, "hops", hops,
+		"memories", len(memOut), "entities", len(entOut))
+	return nil, EntityNeighborsOutput{
+		EntityID: in.EntityID,
+		Memories: memOut,
+		Entities: entOut,
+	}, nil
 }
 
 // --- Session tools (Phase 6c) ---
@@ -2659,8 +2978,22 @@ func (s *Server) handleSessionEnd(ctx context.Context, _ *mcpsdk.CallToolRequest
 	// Sort for determinism (useful for logs and tests).
 	sort.Strings(clusterIDs)
 
-	// Step 2: scoped decay tick — bump all, reset the touched set to 0.
-	if err := s.mgr.TickDecay(ctx, clusterIDs); err != nil {
+	// Step 2a: resolve buffered-memory mentions → entity IDs so the
+	// scoped tick can reset those entities' turns_since alongside the
+	// clusters. Empty buffer → empty set → entities decay normally.
+	bufferMemoryIDs := make([]string, 0, len(sess.WorkingMem.Buffer))
+	for _, ref := range sess.WorkingMem.Buffer {
+		bufferMemoryIDs = append(bufferMemoryIDs, ref.ID)
+	}
+	entityIDs, err := s.store.ListEntitiesByMemoryIDs(ctx, bufferMemoryIDs)
+	if err != nil {
+		return nil, SessionEndOutput{}, fmt.Errorf("list entities by memory ids: %w", err)
+	}
+	sort.Strings(entityIDs)
+
+	// Step 2b: scoped decay tick — bump all clusters and entities,
+	// reset the touched sets to 0.
+	if err := s.mgr.TickDecayWithEntities(ctx, clusterIDs, entityIDs); err != nil {
 		return nil, SessionEndOutput{}, fmt.Errorf("tick decay: %w", err)
 	}
 
@@ -2735,6 +3068,7 @@ func (s *Server) handleSessionEnd(ctx context.Context, _ *mcpsdk.CallToolRequest
 	s.logger.Info("memory_session_end",
 		"session_id", in.SessionID,
 		"clusters_ticked", out.ClustersTicked,
+		"entities_ticked", len(entityIDs),
 		"episode_written", out.EpisodeID != "",
 	)
 	return nil, out, nil

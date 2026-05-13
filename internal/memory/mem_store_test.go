@@ -594,8 +594,9 @@ func TestMemDeleteEpisode(t *testing.T) {
 		t.Fatalf("InsertEpisode: %v", err)
 	}
 
-	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
+	// Add an evidence edge so we can confirm cascade.
+	if _, err := s.AddEdge(ctx, Edge{SrcID: factID, DstID: epID, EdgeType: "evidence", Weight: 1.0}); err != nil {
+		t.Fatalf("AddEdge: %v", err)
 	}
 
 	// Delete episode.
@@ -611,222 +612,18 @@ func TestMemDeleteEpisode(t *testing.T) {
 		t.Error("GetEpisode after delete returned non-nil")
 	}
 
-	// Links should be cascade-deleted.
-	links, err := s.GetFactLinks(ctx, factID)
+	// Evidence edges should be cascade-deleted.
+	edges, err := s.ListEdges(ctx, factID, 1)
 	if err != nil {
-		t.Fatalf("GetFactLinks after episode delete: %v", err)
+		t.Fatalf("ListEdges after episode delete: %v", err)
 	}
-	if len(links) != 0 {
-		t.Errorf("expected 0 links after episode delete, got %d", len(links))
+	if len(edges) != 0 {
+		t.Errorf("expected 0 edges after episode delete, got %d", len(edges))
 	}
 
 	// Deleting a non-existent id should not error.
 	if err := s.DeleteEpisode(ctx, "nonexistent"); err != nil {
 		t.Errorf("DeleteEpisode(nonexistent) = %v, want nil", err)
-	}
-}
-
-// --- Phase 3: Cross-link tests ---
-
-func TestMemLinkFactEpisode_Insert(t *testing.T) {
-	s := NewMemStore()
-	ctx := context.Background()
-
-	factID, err := s.InsertFact(ctx, testdataFacts()[0])
-	if err != nil {
-		t.Fatalf("InsertFact: %v", err)
-	}
-	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
-	if err != nil {
-		t.Fatalf("InsertEpisode: %v", err)
-	}
-
-	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
-	}
-
-	// Verify via GetFactLinks.
-	epLinks, err := s.GetFactLinks(ctx, factID)
-	if err != nil {
-		t.Fatalf("GetFactLinks: %v", err)
-	}
-	if len(epLinks) != 1 {
-		t.Fatalf("GetFactLinks returned %d links, want 1", len(epLinks))
-	}
-	if epLinks[0].EpisodeID != epID {
-		t.Errorf("EpisodeID = %q, want %q", epLinks[0].EpisodeID, epID)
-	}
-	if epLinks[0].LinkType != "evidence" {
-		t.Errorf("LinkType = %q, want %q", epLinks[0].LinkType, "evidence")
-	}
-	if epLinks[0].Episode == nil {
-		t.Fatal("Episode not eager-loaded")
-	}
-	if epLinks[0].Episode.ID != epID {
-		t.Errorf("eager-loaded Episode.ID = %q, want %q", epLinks[0].Episode.ID, epID)
-	}
-
-	// Verify via GetEpisodeLinks.
-	fLinks, err := s.GetEpisodeLinks(ctx, epID)
-	if err != nil {
-		t.Fatalf("GetEpisodeLinks: %v", err)
-	}
-	if len(fLinks) != 1 {
-		t.Fatalf("GetEpisodeLinks returned %d links, want 1", len(fLinks))
-	}
-	if fLinks[0].FactID != factID {
-		t.Errorf("FactID = %q, want %q", fLinks[0].FactID, factID)
-	}
-	if fLinks[0].Fact == nil {
-		t.Fatal("Fact not eager-loaded")
-	}
-	if fLinks[0].Fact.ID != factID {
-		t.Errorf("eager-loaded Fact.ID = %q, want %q", fLinks[0].Fact.ID, factID)
-	}
-}
-
-func TestMemLinkFactEpisode_CascadeOnFactDelete(t *testing.T) {
-	s := NewMemStore()
-	ctx := context.Background()
-
-	factID, err := s.InsertFact(ctx, testdataFacts()[0])
-	if err != nil {
-		t.Fatalf("InsertFact: %v", err)
-	}
-	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
-	if err != nil {
-		t.Fatalf("InsertEpisode: %v", err)
-	}
-	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
-	}
-
-	// Delete fact — link should cascade.
-	if err := s.DeleteFact(ctx, factID); err != nil {
-		t.Fatalf("DeleteFact: %v", err)
-	}
-
-	links, err := s.GetEpisodeLinks(ctx, epID)
-	if err != nil {
-		t.Fatalf("GetEpisodeLinks: %v", err)
-	}
-	if len(links) != 0 {
-		t.Errorf("expected 0 links after fact delete, got %d", len(links))
-	}
-}
-
-func TestMemLinkFactEpisode_CascadeOnEpisodeDelete(t *testing.T) {
-	s := NewMemStore()
-	ctx := context.Background()
-
-	factID, err := s.InsertFact(ctx, testdataFacts()[0])
-	if err != nil {
-		t.Fatalf("InsertFact: %v", err)
-	}
-	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
-	if err != nil {
-		t.Fatalf("InsertEpisode: %v", err)
-	}
-	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
-	}
-
-	// Delete episode — link should cascade.
-	if err := s.DeleteEpisode(ctx, epID); err != nil {
-		t.Fatalf("DeleteEpisode: %v", err)
-	}
-
-	links, err := s.GetFactLinks(ctx, factID)
-	if err != nil {
-		t.Fatalf("GetFactLinks: %v", err)
-	}
-	if len(links) != 0 {
-		t.Errorf("expected 0 links after episode delete, got %d", len(links))
-	}
-}
-
-// --- Phase 4A: LinkFactEpisode / UnlinkFactEpisode idempotency ---
-
-func TestMemLinkFactEpisode_CreatedFlag(t *testing.T) {
-	s := NewMemStore()
-	ctx := context.Background()
-
-	factID, err := s.InsertFact(ctx, testdataFacts()[0])
-	if err != nil {
-		t.Fatalf("InsertFact: %v", err)
-	}
-	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
-	if err != nil {
-		t.Fatalf("InsertEpisode: %v", err)
-	}
-
-	created, err := s.LinkFactEpisode(ctx, factID, epID, "evidence")
-	if err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
-	}
-	if !created {
-		t.Error("first LinkFactEpisode: created = false, want true")
-	}
-
-	created, err = s.LinkFactEpisode(ctx, factID, epID, "evidence")
-	if err != nil {
-		t.Fatalf("LinkFactEpisode repeat: %v", err)
-	}
-	if created {
-		t.Error("repeat LinkFactEpisode: created = true, want false")
-	}
-}
-
-func TestMemUnlinkFactEpisode(t *testing.T) {
-	s := NewMemStore()
-	ctx := context.Background()
-
-	factID, err := s.InsertFact(ctx, testdataFacts()[0])
-	if err != nil {
-		t.Fatalf("InsertFact: %v", err)
-	}
-	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
-	if err != nil {
-		t.Fatalf("InsertEpisode: %v", err)
-	}
-
-	// Unlink with no existing link is a no-op.
-	deleted, err := s.UnlinkFactEpisode(ctx, factID, epID)
-	if err != nil {
-		t.Fatalf("UnlinkFactEpisode (absent): %v", err)
-	}
-	if deleted {
-		t.Error("UnlinkFactEpisode (absent): deleted = true, want false")
-	}
-
-	// Create the link, then unlink it.
-	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
-		t.Fatalf("LinkFactEpisode: %v", err)
-	}
-	deleted, err = s.UnlinkFactEpisode(ctx, factID, epID)
-	if err != nil {
-		t.Fatalf("UnlinkFactEpisode: %v", err)
-	}
-	if !deleted {
-		t.Error("UnlinkFactEpisode: deleted = false, want true")
-	}
-
-	// Verify link is gone.
-	links, err := s.GetFactLinks(ctx, factID)
-	if err != nil {
-		t.Fatalf("GetFactLinks after unlink: %v", err)
-	}
-	if len(links) != 0 {
-		t.Errorf("expected 0 links after unlink, got %d", len(links))
-	}
-
-	// Second unlink is a no-op.
-	deleted, err = s.UnlinkFactEpisode(ctx, factID, epID)
-	if err != nil {
-		t.Fatalf("UnlinkFactEpisode repeat: %v", err)
-	}
-	if deleted {
-		t.Error("UnlinkFactEpisode repeat: deleted = true, want false")
 	}
 }
 
@@ -2397,3 +2194,32 @@ func TestMemCountSupersededFacts(t *testing.T) {
 		t.Errorf("after one supersede = %d, want 1", got)
 	}
 }
+
+// --- Phase 7 knowledge graph: KG method wrappers ---
+
+func memFactory(t *testing.T) Store { t.Helper(); return NewMemStore() }
+
+func TestMemAddEdge_Idempotent(t *testing.T)      { kgRunAddEdgeIdempotent(t, memFactory) }
+func TestMemRemoveEdge(t *testing.T)              { kgRunRemoveEdge(t, memFactory) }
+func TestMemListEdges_TwoHops(t *testing.T)       { kgRunListEdgesTwoHops(t, memFactory) }
+func TestMemUpsertEntity_ExactDedup(t *testing.T) { kgRunUpsertEntityExactDedup(t, memFactory) }
+func TestMemUpsertEntity_SimilarityDedup(t *testing.T) {
+	kgRunUpsertEntitySimilarityDedup(t, memFactory)
+}
+func TestMemUpsertEntity_DifferentTypeNotDedup(t *testing.T) {
+	kgRunUpsertEntityDifferentType(t, memFactory)
+}
+func TestMemTickAllEntities_TwoTicksWithoutAccess(t *testing.T) {
+	kgRunTickAllEntitiesNoAccess(t, memFactory)
+}
+func TestMemTickAllEntities_AccessedReset(t *testing.T) {
+	kgRunTickAllEntitiesAccessedReset(t, memFactory)
+}
+func TestMemAddEntityMentions_Idempotent(t *testing.T) {
+	kgRunAddEntityMentionsIdempotent(t, memFactory)
+}
+func TestMemListMemoriesByEntity(t *testing.T)      { kgRunListMemoriesByEntity(t, memFactory) }
+func TestMemListEntityNeighbors_Hops1(t *testing.T) { kgRunListEntityNeighborsHops1(t, memFactory) }
+func TestMemCascadeOnDeleteFact(t *testing.T)       { kgRunCascadeOnDeleteFact(t, memFactory) }
+func TestMemListEntitiesByMemoryIDs(t *testing.T)   { kgRunListEntitiesByMemoryIDs(t, memFactory) }
+func TestMemCountEntitiesAndEdges(t *testing.T)     { kgRunCountEntitiesAndEdges(t, memFactory) }

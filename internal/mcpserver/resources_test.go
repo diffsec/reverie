@@ -937,6 +937,64 @@ func TestStatusResource_Phase5AFieldsPopulated(t *testing.T) {
 	}
 }
 
+// TestStatusResource_GraphCounts asserts that the Phase 7 entities/edges
+// counts on reverie://status are present and accurate. Seeds two
+// entities and one edge via the tool layer and reads the resource.
+func TestStatusResource_GraphCounts(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["alpha (file)"] = []float32{1, 0, 0, 0}
+	emb.vectors["beta (file)"] = []float32{0, 1, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Baseline: empty DB → zero entities, zero edges.
+	pre := readStatus(t, s)
+	if pre.Counts.Entities != 0 {
+		t.Errorf("pre-seed entities = %d, want 0", pre.Counts.Entities)
+	}
+	if pre.Counts.Edges != 0 {
+		t.Errorf("pre-seed edges = %d, want 0", pre.Counts.Edges)
+	}
+
+	// Seed two entities + one edge via tool handlers.
+	_, e1, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "alpha", EntityType: "file"})
+	if err != nil {
+		t.Fatalf("upsert alpha: %v", err)
+	}
+	_, e2, err := s.handleEntityUpsert(ctx, nil, EntityUpsertInput{Name: "beta", EntityType: "file"})
+	if err != nil {
+		t.Fatalf("upsert beta: %v", err)
+	}
+	if _, _, err := s.handleEdgeAdd(ctx, nil, EdgeAddInput{SrcID: e1.EntityID, DstID: e2.EntityID, EdgeType: "references"}); err != nil {
+		t.Fatalf("edge add: %v", err)
+	}
+
+	post := readStatus(t, s)
+	if post.Counts.Entities != 2 {
+		t.Errorf("post-seed entities = %d, want 2", post.Counts.Entities)
+	}
+	if post.Counts.Edges != 1 {
+		t.Errorf("post-seed edges = %d, want 1", post.Counts.Edges)
+	}
+
+	// JSON shape: the new keys must actually serialize as "entities"/"edges".
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://status"}
+	result, err := s.handleStatusResource(ctx, req)
+	if err != nil {
+		t.Fatalf("handleStatusResource: %v", err)
+	}
+	raw := result.Contents[0].Text
+	if !strings.Contains(raw, `"entities":2`) {
+		t.Errorf("expected \"entities\":2 in JSON, got: %s", raw)
+	}
+	if !strings.Contains(raw, `"edges":1`) {
+		t.Errorf("expected \"edges\":1 in JSON, got: %s", raw)
+	}
+}
+
 func TestStatusResource_EmptyDB(t *testing.T) {
 	emb := newStubEmbedder(4)
 	s := newTestServer(emb)
