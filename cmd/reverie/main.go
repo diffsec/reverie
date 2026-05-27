@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
+	"time"
 
 	"github.com/diffsec/reverie/internal/cluster"
 	"github.com/diffsec/reverie/internal/config"
@@ -181,16 +183,43 @@ func runStatus() error {
 	defer database.Close()
 
 	store := memory.NewSQLiteStore(database)
-
 	ctx := context.Background()
 
-	// Count all facts.
-	allFacts, err := store.ListFacts(ctx, memory.ListFilter{Limit: 1000})
+	// Pull layer counts. ListFacts/ListEpisodes are bounded by Limit -- the
+	// Store interface doesn't expose CountFacts/CountEpisodes yet, so len() of
+	// a generously-bounded list is the current workaround. 10_000 is enough
+	// to be effectively unbounded for any realistic local install.
+	allFacts, err := store.ListFacts(ctx, memory.ListFilter{Limit: 10000})
 	if err != nil {
 		return fmt.Errorf("list facts: %w", err)
 	}
+	clusters, err := store.ListClusters(ctx)
+	if err != nil {
+		return fmt.Errorf("list clusters: %w", err)
+	}
+	episodes, err := store.ListEpisodes(ctx, memory.ListFilter{Limit: 10000})
+	if err != nil {
+		return fmt.Errorf("list episodes: %w", err)
+	}
+	supersededCount, err := store.CountSupersededFacts(ctx)
+	if err != nil {
+		return fmt.Errorf("count superseded facts: %w", err)
+	}
+	entityCount, err := store.CountEntities(ctx)
+	if err != nil {
+		return fmt.Errorf("count entities: %w", err)
+	}
+	edgeCount, err := store.CountEdges(ctx)
+	if err != nil {
+		return fmt.Errorf("count edges: %w", err)
+	}
+	lastTick, err := store.GetLastTick(ctx)
+	if err != nil {
+		return fmt.Errorf("get last tick: %w", err)
+	}
 
-	// Count by subtype.
+	// Count facts by subtype (sorted for deterministic output -- map range
+	// order would shuffle the section each run).
 	subtypeCounts := make(map[string]int)
 	for _, f := range allFacts {
 		key := f.Subtype
@@ -199,6 +228,11 @@ func runStatus() error {
 		}
 		subtypeCounts[key]++
 	}
+	subtypes := make([]string, 0, len(subtypeCounts))
+	for k := range subtypeCounts {
+		subtypes = append(subtypes, k)
+	}
+	sort.Strings(subtypes)
 
 	// Get DB file size.
 	var dbSize int64
@@ -211,16 +245,38 @@ func runStatus() error {
 	fmt.Printf("Database: %s\n", cfg.Storage.DBPath)
 	fmt.Printf("DB size:  %s\n", formatBytes(dbSize))
 	fmt.Println()
-	fmt.Printf("L2 semantic facts: %d\n", len(allFacts))
-	for subtype, count := range subtypeCounts {
-		fmt.Printf("  %-12s %d\n", subtype, count)
+
+	fmt.Println("Memory layers")
+	fmt.Printf("  L1 clusters:  %d\n", len(clusters))
+	if supersededCount > 0 {
+		fmt.Printf("  L2 facts:     %d  (+ %d superseded)\n", len(allFacts), supersededCount)
+	} else {
+		fmt.Printf("  L2 facts:     %d\n", len(allFacts))
+	}
+	for _, subtype := range subtypes {
+		fmt.Printf("    %-10s  %d\n", subtype, subtypeCounts[subtype])
+	}
+	fmt.Printf("  L3 episodes:  %d\n", len(episodes))
+	fmt.Println()
+
+	fmt.Println("Knowledge graph")
+	fmt.Printf("  entities:     %d\n", entityCount)
+	fmt.Printf("  edges:        %d\n", edgeCount)
+	fmt.Println()
+
+	fmt.Println("Decay")
+	if lastTick.IsZero() {
+		fmt.Println("  last tick:    never")
+	} else {
+		fmt.Printf("  last tick:    %s (%s ago)\n",
+			lastTick.Format(time.RFC3339),
+			time.Since(lastTick).Truncate(time.Second))
 	}
 	fmt.Println()
-	fmt.Println("L1 clusters:  (Phase 3)")
-	fmt.Println("L3 episodes:  (Phase 3)")
-	fmt.Println()
-	fmt.Printf("Embedding model: %s\n", cfg.Embedding.Model)
-	fmt.Printf("Disabled:        %v\n", cfg.Server.Disabled)
+
+	fmt.Println("Config")
+	fmt.Printf("  Embedding model: %s\n", cfg.Embedding.Model)
+	fmt.Printf("  Disabled:        %v\n", cfg.Server.Disabled)
 
 	return nil
 }
