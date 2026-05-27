@@ -25,38 +25,15 @@ Sessions are opt-in: all existing tools keep working without a `session_id`. But
 
 ## Step 1: Add the CLAUDE.md preamble
 
-Append the following to `~/.claude/CLAUDE.md` (after any existing content):
+Append the canonical preamble ([`scripts/reverie-preamble.md`](../scripts/reverie-preamble.md)) to `~/.claude/CLAUDE.md`. It covers the full session lifecycle (`session_start` / `memory_session_init` / `memory_session_end`) -- that lifecycle is what replaces the per-conversation auto-memory file.
 
-```markdown
-## Memory — Reverie
+If you ran `./scripts/install.sh`, this is already done -- the installer injects the preamble between managed markers in `~/.claude/CLAUDE.md`. For a manual install:
 
-All persistent memory goes through the `reverie` MCP server. Do not write to ~/.claude/projects/*/memory/ files — that system is disabled.
-
-### Session lifecycle (replaces the per-conversation file)
-- At the start of each conversation, call `memory_session_init` with a stable `session_id` (e.g., project name + date) and an optional `project_hint`. If the session already exists, its prior buffer comes back — treat it as already-loaded working memory.
-- Pass that `session_id` into every subsequent `memory_recall` / `memory_apply_judgment` / `memory_reinforce` / `memory_write`. The buffer auto-updates under a bounded budget.
-- At the end of a conversation, call `memory_session_end` with the `session_id`, optionally with an `episode` payload summarizing significant work. This runs a scoped decay tick and closes the session.
-- The `session_start` and `session_end` prompts encode the full lifecycle.
-
-### Recall
-- At session start, call `memory_recall` with the project/task context. Prefer reading `reverie://l1/index` before your first recall.
-- Before architectural decisions, recall relevant project/reference memories.
-- If a recall returns more than ~5 candidates OR the query is sensitive to staleness (user asking about "current" state, deciding between competing facts), follow up with the `memory-judge` skill: spawn a Task subagent with the candidates, collect keep/drop verdicts, then call `memory_apply_judgment` with the results. For quick lookups, use the candidates as-is.
-
-### Write (type must be one of user | feedback | project | reference)
-- user — stable personal facts (role, preferences, skills)
-- feedback — how to behave (corrections you want preserved)
-- project — architecture, conventions, decisions for a codebase
-- reference — pointers to docs/repos/URLs
-- If the content is retrospective (situation → action → outcome → lesson), pass an `episode` payload to promote to L3.
-Do NOT write transient task state.
-
-### Reinforce & forget
-- After using recalled memories in a response, call `memory_reinforce` with their IDs.
-- On user correction, `memory_forget` the stale memory and write the correction.
+```bash
+{ printf '\n'; cat scripts/reverie-preamble.md; } >> ~/.claude/CLAUDE.md
 ```
 
-This preamble teaches Claude Code to use reverie's tools instead of the built-in memory system.
+This teaches Claude Code to use reverie's tools instead of the built-in memory system.
 
 ## Step 2: Disable auto-memory
 
