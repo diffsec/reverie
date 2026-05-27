@@ -94,29 +94,15 @@ No API keys or `environment` block needed with Ollama. If using Voyage instead, 
 
 OpenCode uses `AGENTS.md` as the equivalent of Claude Code's `CLAUDE.md` -- it's loaded into every session as project/global guidance. Place it at `~/.config/opencode/AGENTS.md` (global) or `AGENTS.md` in your project root (project-local).
 
-Append the following to your `AGENTS.md`:
+The canonical preamble lives at [`scripts/reverie-preamble.md`](../scripts/reverie-preamble.md) -- single source of truth for the agent-facing memory instructions.
 
-```markdown
-## Memory — Reverie
+If you ran `./scripts/install.sh`, it's already injected into `~/.config/opencode/AGENTS.md` between managed markers (`<!-- BEGIN reverie-preamble -->` ... `<!-- END reverie-preamble -->`) and will be refreshed in place on subsequent runs. Pass `--skip-preamble` to opt out.
 
-All persistent memory goes through the `reverie` MCP server. Do not write to ~/.claude/projects/*/memory/ files — that system is disabled.
+For a manual install, append the file's contents to your global `AGENTS.md`:
 
-### Recall
-- At session start, call `memory_recall` with the project/task context. Prefer reading `reverie://l1/index` before your first recall.
-- Before architectural decisions, recall relevant project/reference memories.
-- If a recall returns more than ~5 candidates OR the query is sensitive to staleness (user asking about "current" state, deciding between competing facts), follow up with the `memory-judge` skill: spawn a Task subagent with the candidates, collect keep/drop verdicts, then call `memory_apply_judgment` with the results. For quick lookups, use the candidates as-is.
-
-### Write (type must be one of user | feedback | project | reference)
-- user — stable personal facts (role, preferences, skills)
-- feedback — how to behave (corrections you want preserved)
-- project — architecture, conventions, decisions for a codebase
-- reference — pointers to docs/repos/URLs
-- If the content is retrospective (situation → action → outcome → lesson), pass an `episode` payload to promote to L3.
-Do NOT write transient task state.
-
-### Reinforce & forget
-- After using recalled memories in a response, call `memory_reinforce` with their IDs.
-- On user correction, `memory_forget` the stale memory and write the correction.
+```bash
+mkdir -p ~/.config/opencode
+{ printf '\n'; cat scripts/reverie-preamble.md; } >> ~/.config/opencode/AGENTS.md
 ```
 
 This teaches OpenCode how and when to use reverie's tools in every session.
