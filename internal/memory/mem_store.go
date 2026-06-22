@@ -766,39 +766,17 @@ func (m *memStore) ListEdges(_ context.Context, memoryID string, hops int) ([]Ed
 	return results, nil
 }
 
-// UpsertEntity dedups exact then by cosine similarity within the same
-// entity_type, mirroring the sqliteStore semantics. The caller-supplied
-// embedding is stored verbatim.
+// UpsertEntity dedups by (name, entity_type) exact match only, mirroring
+// the sqliteStore semantics. The caller-supplied embedding is stored
+// verbatim; the matchedBySimilarity return is always false.
 func (m *memStore) UpsertEntity(_ context.Context, name, entityType string, embedding []float32) (string, bool, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Exact dedup.
+	// Exact dedup on (name, entity_type).
 	for _, ent := range m.entities {
 		if ent.Name == name && ent.EntityType == entityType {
 			return ent.ID, false, false, nil
-		}
-	}
-
-	// Similarity dedup within the same entity_type.
-	if len(embedding) > 0 {
-		var bestID string
-		var bestSim float32
-		for _, ent := range m.entities {
-			if ent.EntityType != entityType {
-				continue
-			}
-			if len(ent.Embedding) == 0 {
-				continue
-			}
-			sim := vecmath.Cosine(embedding, ent.Embedding)
-			if sim > bestSim {
-				bestSim = sim
-				bestID = ent.ID
-			}
-		}
-		if bestID != "" && float64(bestSim) >= defaultEntitySimilarityThreshold {
-			return bestID, false, true, nil
 		}
 	}
 

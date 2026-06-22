@@ -10,7 +10,7 @@ The proto-graph (`fact_episode_links` L2<->L3 evidence links with one free-form 
 
 ## Non-goals
 
-- No entity resolution beyond exact `(name, entity_type)` match + cosine-similarity fallback. No NER, fuzzy person-name matching, or co-reference.
+- No entity resolution beyond exact `(name, entity_type)` match. No NER, fuzzy person-name matching, or co-reference. (The original design added a cosine-similarity fallback; it was removed — see the dated note under Locked decisions.)
 - No automatic edge inference from co-occurrence -- edges are explicit caller actions (Gate-A pattern preserved; no internal LLM calls).
 - No graph-aware recall in this phase -- `memory_recall` is untouched. Reserved for 7C.
 - No remote graph DB option -- SQLite stays.
@@ -22,11 +22,13 @@ The proto-graph (`fact_episode_links` L2<->L3 evidence links with one free-form 
 |---|---|---|
 | Edge retention model | Compute on read as `min(src_retention, dst_retention)` | Avoids a third decay tick path; matches "edges as ephemeral relationships between durable nodes" semantics. No `retention` column on `memory_edges`. |
 | Entity-embedding text format | `name + " (" + entity_type + ")"` | Deterministic; cache-friendly; encodes both fields so `("foo", "file")` and `("foo", "concept")` have different embeddings. |
-| Entity similarity-dedup threshold | Reuse `cfg.Memory.SimilarityThreshold` | No new config field; same threshold the recall path uses. |
+| Entity similarity-dedup threshold | ~~Reuse `cfg.Memory.SimilarityThreshold`~~ **Superseded — dedup is now exact `(name, entity_type)` only** | See dated note below. |
 | Session-end entity reset | At `memory_session_end`, query `entity_mentions` for memories in `WorkingMemory.Buffer`; reset those entities' `turns_since=0` | No buffer schema change; uses existing buffered memory IDs as the access set. |
 | `ReplaceEpisodeLinks` fate | Keep signature; retarget implementation at `memory_edges` with `edge_type='evidence'` | Minimizes Phase-1 surface change; preserves the `EpisodePayload.LinkedFactIDs` write path. |
 | Edge `hops` cap | `memory_edge_list` accepts `hops` 1..3, default 1; Go-side BFS | Bounded traversal; 3 hops is sufficient for evidence chains without runaway expansion. |
 | Free-form `edge_type` strings | Caller-supplied; canonical types documented in README (`evidence`, `causes`, `contradicts`, `supports`, `refines`, `depends_on`, `references`) | Same precedent as Phase 4's `link_type`; no enforcement at the schema layer. |
+
+> **Update (2026-06): entity dedup is exact-match only.** The cosine-similarity fallback (originally gated by a hard-coded `0.55` cutoff, never plumbed to `cfg.Memory.SimilarityThreshold`) was removed from `UpsertEntity`. With `nomic-embed-text`, the short embedding text `name + " (" + entity_type + ")"` made unrelated same-type entities score above any usable threshold — a backfill collapsed all `tool` entities onto one node and all `framework` entities onto another. `UpsertEntity` now dedups on exact `(name, entity_type)` only; `MatchedBySimilarity` is retained in the return for interface compatibility and is always `false`. `FindSimilarEntities` remains on the store interface but is no longer called by upsert. The pseudocode and field notes below describe the original (superseded) design.
 
 ## Migration 5
 
@@ -156,7 +158,7 @@ type EntityUpsertOutput struct {
 }
 ```
 
-Embedding is computed on insert from `name + " (" + entity_type + ")"`. Dedup order: exact `(name, entity_type)` -> cosine within same `entity_type` >= `SimilarityThreshold` -> insert. `MatchedBySimilarity=true` lets the caller log/inspect fuzzy hits.
+Embedding is computed on insert from `name + " (" + entity_type + ")"` and stored verbatim. Dedup is exact `(name, entity_type)` only (see the 2026-06 update note above); `MatchedBySimilarity` is always `false`. _Originally:_ exact -> cosine within same `entity_type` >= `SimilarityThreshold` -> insert.
 
 ### `memory_entity_mention`
 
@@ -258,6 +260,8 @@ return results
 Each edge contributes exactly one `EdgeDetail` (the depth at which BFS first reached the other endpoint). Cycles cannot duplicate rows because the visited set is keyed by node ID. `OtherLayer` and `ContentPreview` are filled in by a layered lookup (`GetFact` -> `GetEpisode` -> `GetEntity`) per emitted result.
 
 ### Entity dedup
+
+> Superseded: steps 2-4 (the cosine fallback) were removed; upsert now does step 1 then step 5. See the 2026-06 update note above.
 
 `UpsertEntity(name, entityType)`:
 

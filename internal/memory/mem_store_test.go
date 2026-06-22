@@ -2203,8 +2203,8 @@ func TestMemAddEdge_Idempotent(t *testing.T)      { kgRunAddEdgeIdempotent(t, me
 func TestMemRemoveEdge(t *testing.T)              { kgRunRemoveEdge(t, memFactory) }
 func TestMemListEdges_TwoHops(t *testing.T)       { kgRunListEdgesTwoHops(t, memFactory) }
 func TestMemUpsertEntity_ExactDedup(t *testing.T) { kgRunUpsertEntityExactDedup(t, memFactory) }
-func TestMemUpsertEntity_SimilarityDedup(t *testing.T) {
-	kgRunUpsertEntitySimilarityDedup(t, memFactory)
+func TestMemUpsertEntity_NoSimilarityMerge(t *testing.T) {
+	kgRunUpsertEntityNoSimilarityMerge(t, memFactory)
 }
 func TestMemUpsertEntity_DifferentTypeNotDedup(t *testing.T) {
 	kgRunUpsertEntityDifferentType(t, memFactory)

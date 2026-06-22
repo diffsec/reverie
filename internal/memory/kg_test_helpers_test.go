@@ -161,7 +161,7 @@ func kgRunUpsertEntityExactDedup(t *testing.T, newStore kgTestFactory) {
 	}
 }
 
-func kgRunUpsertEntitySimilarityDedup(t *testing.T, newStore kgTestFactory) {
+func kgRunUpsertEntityNoSimilarityMerge(t *testing.T, newStore kgTestFactory) {
 	s := newStore(t)
 	ctx := context.Background()
 
@@ -171,19 +171,21 @@ func kgRunUpsertEntitySimilarityDedup(t *testing.T, newStore kgTestFactory) {
 		t.Fatalf("first UpsertEntity: %v", err)
 	}
 
-	// Different name, almost-parallel vector (cos ~= 0.96, well above 0.55).
+	// Different name, almost-parallel vector (cos ~= 0.96). Dedup is now
+	// exact (name, entity_type) only: a distinct name must NOT merge by
+	// similarity, even at high cosine — it gets its own node.
 	id2, created, sim, err := s.UpsertEntity(ctx, "config_loader", "file", []float32{0.96, 0.28, 0, 0})
 	if err != nil {
 		t.Fatalf("second UpsertEntity: %v", err)
 	}
-	if created {
-		t.Error("similarity dedup: created = true, want false (should reuse)")
+	if !created {
+		t.Error("exact-only upsert: created = false, want true (distinct name -> new node)")
 	}
-	if !sim {
-		t.Error("similarity dedup: matchedBySimilarity = false, want true")
+	if sim {
+		t.Error("exact-only upsert: matchedBySimilarity = true, want false (no fuzzy merge)")
 	}
-	if id1 != id2 {
-		t.Errorf("similarity dedup returned different id: %q vs %q", id1, id2)
+	if id1 == id2 {
+		t.Errorf("exact-only upsert collapsed distinct names onto one id: %q", id1)
 	}
 }
 
