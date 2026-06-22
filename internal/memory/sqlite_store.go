@@ -757,17 +757,6 @@ func (s *sqliteStore) CountEpisodesByCluster(ctx context.Context, clusterID stri
 // which row a given ID belongs to. Cascade-on-delete for facts/episodes
 // lives in DeleteFact/DeleteEpisode above.
 
-// defaultEntitySimilarityThreshold is the cosine-similarity cutoff used by
-// UpsertEntity when no explicit threshold is plumbed through. The store
-// interface deliberately omits a threshold parameter (the design doc locks
-// reuse of cfg.Memory.SimilarityThreshold, which lives in the MCP layer);
-// 0.55 is a conservative value that catches obvious typos under nomic-style
-// embeddings without collapsing unrelated entities.
-//
-// TODO(phase-2): plumb cfg.Memory.SimilarityThreshold through the handler so
-// this constant can be removed.
-const defaultEntitySimilarityThreshold = 0.55
-
 // AddEdge inserts a typed directed edge keyed by (src_id, dst_id,
 // edge_type). Idempotent: a repeat call returns created=false without
 // touching the existing row's weight.
@@ -899,14 +888,15 @@ func indexOfFrontier(frontier []string, id string) (int, bool) {
 	return 0, false
 }
 
-// UpsertEntity dedups by (name, entity_type) exact match, then by cosine
-// similarity within the same entity_type (using
-// defaultEntitySimilarityThreshold). Only inserts on miss; the caller-
-// supplied embedding is stored verbatim. Layer text format
-// "name + (entity_type)" is the caller's responsibility per the design
-// doc's locked decision.
+// UpsertEntity dedups by (name, entity_type) exact match only. Only
+// inserts on miss; the caller-supplied embedding is stored verbatim.
+// Layer text format "name + (entity_type)" is the caller's
+// responsibility per the design doc's locked decision. The third return
+// (matchedBySimilarity) is retained for interface compatibility and is
+// always false: fuzzy same-type merging was removed because short-name
+// nomic embeddings collapsed unrelated entities onto one node.
 func (s *sqliteStore) UpsertEntity(ctx context.Context, name, entityType string, embedding []float32) (string, bool, bool, error) {
-	// Step 1: exact dedup.
+	// Exact dedup on (name, entity_type).
 	var existingID string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id FROM entities WHERE name = ? AND entity_type = ?`,
@@ -919,19 +909,7 @@ func (s *sqliteStore) UpsertEntity(ctx context.Context, name, entityType string,
 		return "", false, false, fmt.Errorf("sqlite store: upsert entity: exact lookup: %w", err)
 	}
 
-	// Step 2: similarity dedup (skipped when caller did not supply an
-	// embedding — same-type cosine is meaningless without one).
-	if len(embedding) > 0 {
-		matches, simErr := s.FindSimilarEntities(ctx, embedding, entityType, defaultEntitySimilarityThreshold, 1)
-		if simErr != nil {
-			return "", false, false, fmt.Errorf("sqlite store: upsert entity: similarity lookup: %w", simErr)
-		}
-		if len(matches) > 0 {
-			return matches[0].Entity.ID, false, true, nil
-		}
-	}
-
-	// Step 3: insert.
+	// Insert on miss.
 	id := uuid.New().String()
 	now := time.Now().UTC().Format(timeFormat)
 	embBlob := EncodeVector(embedding)

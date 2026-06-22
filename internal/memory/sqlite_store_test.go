@@ -2403,8 +2403,8 @@ func TestSQLiteAddEdge_Idempotent(t *testing.T)      { kgRunAddEdgeIdempotent(t,
 func TestSQLiteRemoveEdge(t *testing.T)              { kgRunRemoveEdge(t, sqliteFactory) }
 func TestSQLiteListEdges_TwoHops(t *testing.T)       { kgRunListEdgesTwoHops(t, sqliteFactory) }
 func TestSQLiteUpsertEntity_ExactDedup(t *testing.T) { kgRunUpsertEntityExactDedup(t, sqliteFactory) }
-func TestSQLiteUpsertEntity_SimilarityDedup(t *testing.T) {
-	kgRunUpsertEntitySimilarityDedup(t, sqliteFactory)
+func TestSQLiteUpsertEntity_NoSimilarityMerge(t *testing.T) {
+	kgRunUpsertEntityNoSimilarityMerge(t, sqliteFactory)
 }
 func TestSQLiteUpsertEntity_DifferentTypeNotDedup(t *testing.T) {
 	kgRunUpsertEntityDifferentType(t, sqliteFactory)
