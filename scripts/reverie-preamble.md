@@ -2,6 +2,8 @@
 
   All persistent memory goes through the `reverie` MCP server. Do not write to `~/.claude/projects/*/memory/` files — that system is disabled.
 
+  If Ollama is down for reverie, you can start it.
+
   ### Session lifecycle
   - At session start, invoke the `session_start` MCP prompt (or call `memory_session_init` with a stable `session_id`) so the working-memory buffer is restored. Read `reverie://l1/index` before your first recall to see which clusters exist.
   - Pass the same `session_id` to `memory_recall`, `memory_write`, `memory_reinforce`, and `memory_apply_judgment` so the buffer stays in sync. Use `memory_session_snapshot` for an explicit checkpoint, `memory_session_restore` for inspection without `init` semantics.
